@@ -1,0 +1,4 @@
+{
+  "description": "AppHandoff inbox and touched-panes add-ons",
+  "modules": ["./register.ts"]
+}
