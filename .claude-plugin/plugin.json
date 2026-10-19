@@ -1,6 +1,6 @@
 {
   "name": "apphandoff",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "AppHandoff for Claude Code: wakes a chat when someone posts on a ticket it claimed or created or decides a milestone approval it asked for, or when a person accepts or drops a milestone it worked on, and lists the milestones it touched in one Milestones pane, with every approval waiting on you from any chat.",
   "author": {
     "name": "AppHandoff",
