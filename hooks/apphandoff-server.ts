@@ -5,7 +5,7 @@
 // A tool arrives as `mcp__<server>__<tool>`. The host names the server one of
 // two ways: after the connector (`mcp__apphandoff__get`), or by an id (the
 // Claude desktop app: `mcp__74eab0da-aeae-4938-857d-818f76b8f0bc__get`). The
-// nine tool names are generic words, so on their own they prove nothing:
+// ten tool names are generic words, so on their own they prove nothing:
 //   - a server named like AppHandoff is AppHandoff by its tool names alone;
 //   - an id-named server is AppHandoff only once an answer carries text only
 //     AppHandoff writes (answerNamesAppHandoff);
@@ -24,6 +24,7 @@ export const DETECTOR_TOOLS = [
   'plan',
   'message',
   'project',
+  'question',
   'decide_lifecycle_proposal',
 ] as const
 const APPHANDOFF_TOOLS = new Set<string>(DETECTOR_TOOLS)
@@ -34,7 +35,7 @@ export function parseToolName(name: string): { server: string; tool: string } | 
   return m?.[1] && m[2] ? { server: m[1], tool: m[2] } : null
 }
 
-/** Whether `mcp__<server>__<tool>` is an AppHandoff tool by name alone: one of the nine, on a server named like it. */
+/** Whether `mcp__<server>__<tool>` is an AppHandoff tool by name alone: one of the ten, on a server named like it. */
 export function isAppHandoffTool(server: string, tool: string): boolean {
   return APPHANDOFF_TOOLS.has(tool) && /apphandoff/i.test(server)
 }
@@ -82,7 +83,7 @@ export function answerNamesAppHandoff(answer: string | undefined): boolean {
 
 /**
  * Whether a call may turn out to be AppHandoff's, before its answer is in: an
- * AppHandoff-named server's tool, or one of the nine tools on an id-named
+ * AppHandoff-named server's tool, or one of the ten tools on an id-named
  * server. Such a call is held until its answer says whose it is.
  */
 export function mayBeAppHandoff(server: string, tool: string): boolean {
