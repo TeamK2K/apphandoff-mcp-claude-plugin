@@ -21,7 +21,7 @@ export const WAKE_LINES = 10
 /** Pause between seeing new messages and waking, so the chat's own write ids land first. */
 export const OWN_WRITE_SETTLE_MS = 2_000
 
-// Which server is AppHandoff (the nine tool names, a server named like it, an
+// Which server is AppHandoff (the ten tool names, a server named like it, an
 // id-named server's answer) is decided once, in ./apphandoff-server.ts, for
 // the inbox and the touched panes alike.
 import { isAppHandoffCall, isAppHandoffTool, mayBeAppHandoff, parseToolName } from './apphandoff-server'
@@ -236,7 +236,7 @@ export type PendingCall = { tool: string; args: Record<string, unknown> }
 export const PENDING_CALLS_KEPT = 64
 
 /**
- * Record a response row's AppHandoff tool_use blocks by id — one of the nine
+ * Record a response row's AppHandoff tool_use blocks by id — one of the ten
  * tools on a server that may be AppHandoff (named like it, or named by an id,
  * held until its answer says whose it is), or any tool of a connection already
  * learned (`servers`); other MCP servers' calls are never held. The oldest go

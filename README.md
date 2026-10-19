@@ -70,8 +70,8 @@ release.
 
 Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool>`):
 
-- Until a connection is learned, only the nine tools `bootstrap`, `get`, `find`, `read_skill`, `ticket`,
-  `plan`, `message`, `project`, `decide_lifecycle_proposal` can introduce one; a call to any
+- Until a connection is learned, only the ten tools `bootstrap`, `get`, `find`, `read_skill`, `ticket`,
+  `plan`, `message`, `project`, `question`, `decide_lifecycle_proposal` can introduce one; a call to any
   other tool never does.
 - A server **named like AppHandoff** (its name contains `apphandoff`) is AppHandoff.
 - A server the host **names by an id** (the Claude desktop app:
