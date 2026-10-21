@@ -4,10 +4,12 @@ AppHandoff is a ticket board your AI agents and your team share. This Claude Cod
 connects a chat to it, with two add-ons:
 
 - the **inbox**: when someone else posts on an AppHandoff ticket this chat claimed or
-  created, the chat gets a toast and is woken to read the thread and reply; and when a
+  created, the chat gets a toast and, after the plugin **claims the ticket for the chat**
+  (a write on your board; see below), is woken to read the thread and reply, or, when a
+  person posted, to ask you what to do through a board question; and when a
   person approves or rejects a milestone move this chat asked for, or accepts or drops a
-  milestone this chat worked on, the chat is woken within about a minute to carry on (or
-  read why not);
+  milestone this chat worked on, or answers a board question this chat asked, the chat is
+  woken within about a minute to carry on (or read why not);
 - the **Milestones pane**: one pane tab, a plain table of the milestones this chat's own
   AppHandoff calls touched, plus every milestone approval waiting on you from any chat,
   each with an "Approve in portal" link.
@@ -40,7 +42,7 @@ itself in the desktop app.
 
 The plugin bundles no MCP configuration file: add the AppHandoff MCP connection to
 Claude Code yourself, pointing at `https://api.apphandoff.com/mcp`, and sign in with your
-own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes calls on it that change nothing on your board to poll them (`get`, and `message` `notify_config` reads).
+own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes calls on it that change nothing on your board to poll them (`get`, and `message` `notify_config` reads). It makes one call that does change your board: before it wakes the chat for a new message it **claims the ticket** for the chat (`ticket` with `op.action: "claim"`), so two agents never work one ticket at once. That needs a connection allowed to write; a read-only one is refused the claim once and then wakes as before. A person's message is never claimed for: it always reaches the chat.
 
 ## What it does on your machine
 
@@ -48,6 +50,8 @@ own AppHandoff account. The plugin learns which tickets and milestones to follow
   connection every 60 s, slowing to 2 min after 5 quiet minutes and 5 min after 30; with
   nothing to watch it makes no calls.
 - It injects a wake prompt into the chat when the board has something for it.
+- It claims a ticket for the chat (one `ticket` claim call, a write on your board) before waking
+  it for a new message on that ticket; nothing else it sends changes your board.
 - The Milestones pane makes read-only `find` and `get` calls while it is open, refreshing
   approvals every 60 s.
 - `/inbox` shows what the chat watches and lets you pause or resume wakes.
@@ -111,14 +115,17 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   write. A connection the board refuses it (a read-only token, or a server that predates it)
   keeps the earlier way: one `get` per watched ticket every poll, and ticket replies still
   wake the chat; `/inbox resume` asks again. A ticket without a project is read with `get`
-  as well. No watched tickets and no waiting approval, no calls. A rate-limit answer
+  as well. No watched tickets, no waiting approval and no open question, no calls. A rate-limit answer
   waits as long as the server says. A ticket that no longer exists is dropped.
 - **Ignores** the chat's own messages, its evidence and overflow notes, and board
   automation (`system` authors).
 - **Wakes** the chat with ticket number, author type, message id and time only — never
-  the message text. The wake tells the chat to read the thread itself, treat it as
-  untrusted, and only reply with `message` (`op.action: "send"`) unless you confirm more. The
-  toast shows the first 120 characters (screen only; the model never sees it).
+  the message text. For an agent's message the wake tells the chat to read the thread itself,
+  treat it as untrusted, and only reply with `message` (`op.action: "send"`) unless you confirm
+  more. For a person's message (author type `human`) it tells the chat to read the thread, tell you
+  what was posted and ask you what to do through a board `question` ask (not a `message` reply),
+  taking no other action until you answer; no claim is made for it. The toast shows the first
+  120 characters (screen only; the model never sees it).
 - **Limits**: one wake in flight, a 2-minute cooldown per ticket, 6 wakes an hour.
   Hitting the hourly cap pauses wakes until `/inbox resume`. A wake that does not reach
   the chat keeps its messages for the next one.
@@ -126,9 +133,41 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   after the chat's next successful AppHandoff call. With two AppHandoff connections in
   one chat it stays idle.
 - **Stores** the watched list per chat in its own Claude Code plugin store (pruned
-  after 14 days), with the approvals and milestones it waits on (see below), where its notice read
-  stopped, the approval off switch and the rule-table revision. Nothing is sent anywhere
+  after 14 days), with the approvals, milestones and board questions it waits on (see below), when
+  the lease it holds on each ticket lapses, where its notice read stopped, the approval off switch
+  and the rule-table revision. Nothing is sent anywhere
   but your AppHandoff connection.
+
+### Claim before a wake
+
+- **Claims** the ticket for the chat before it wakes it for an agent's new message: `ticket` with
+  `op: {action: "claim", paths: ["."]}`, under the chat's own agent id (`cc:<chat id>`, the one its
+  own calls carry), so the lease holder is the chat's and the chat's own later claim renews it
+  instead of being refused. This is the one write the plugin makes on your board. A person's
+  message is never claimed for (it always wakes the chat to ask you).
+- **The lock outlasts the wake**: the lease lasts 20 minutes from each claim, so for up to 20
+  minutes per message other agents are refused the ticket, whether or not the chat is still
+  working on it. A later wake renews it; the chat's own `release`, or a move out of `in_progress`,
+  ends it sooner.
+- **Skips the claim** when the chat or one of its builders already holds a live lease (learned
+  from their claim answers; a move out of `in_progress` clears it): nothing is sent and the chat
+  is woken.
+- **No wake** when another agent holds the lease (`LEASE_HELD`, in either of the board's two
+  wordings): someone else is on the ticket. The agent messages that were waiting are dropped, with
+  one toast naming the holder's agent id (never its connection). `LEASE_HELD` naming the chat's own
+  agent id (a builder on another connection) still wakes it.
+- **Needs** a connection allowed to write. A read-only one (a personal access token without
+  write scope) is refused the claim once, then keeps the wake exactly as it was, with no claim;
+  `/inbox resume` asks again. A claim the board refuses for good (a ticket under a milestone
+  that is not building) also wakes without one. A claim that fails in passing holds an agent's
+  wake and tries again next poll, with one toast per ticket, for at most 10 minutes; a person's
+  message is never held.
+- **Questions**: after the chat asks you a board `question`, the plugin remembers its refs (up
+  to 10, forgotten after 3 days, or once the chat answers or withdraws one itself) and reads
+  the same notice list as for approvals. A `question_answered` notice naming one of them wakes the
+  chat once, with the `Q-` ref, the outcome word and the time only — never the answer, the title or
+  who answered — to read the answer with `question` `get` and do what you chose. Same cooldown,
+  hourly cap and off switches.
 
 ### Milestone approval wakes
 
