@@ -40,7 +40,7 @@ itself in the desktop app.
 
 The plugin bundles no MCP configuration file: add the AppHandoff MCP connection to
 Claude Code yourself, pointing at `https://api.apphandoff.com/mcp`, and sign in with your
-own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes read-only calls on it to poll them.
+own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes calls on it that change nothing on your board to poll them (`get`, and `message` `notify_config` reads).
 
 ## What it does on your machine
 
@@ -96,10 +96,21 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   recognised above); it never wraps tool calls and never reads other tickets. A claim or ticket made by a subagent of the
   chat is not watched — claim from the main chat; what a subagent posts is still
   recognised as the chat's own, so it never wakes the chat.
-- **Polls** with one `get` (`expand: ["messages"]`, the JSON answer) per watched ticket
-  about every 60 s through the chat's own AppHandoff connection, slowing to 2 min and
-  then 5 min while nothing happens; plus one read when a ticket is first watched. No
-  watched tickets and no waiting approval, no calls. A rate-limit answer
+- **Polls** about every 60 s through the chat's own AppHandoff connection, slowing to 2 min and
+  then 5 min while nothing happens; plus one `get` when a ticket is first watched. Each poll
+  is ONE call per project, `message` with `op: {action: "notify_config", watch: [the watched
+  tickets], since}`, which answers which of them changed (and how many approvals wait on a
+  person, shown in `/inbox`). A quiet board costs that one call; only a ticket it names as
+  changed is then read, with one `get` (`expand: ["messages"]`, the JSON answer). What the
+  board says changed never decides what is new: only the messages that `get` returns do. The
+  call asks from the board's own last-seen time (never this machine's clock) less 5 s; a message
+  that commits late with a time at or below the last one read stays unreported until that ticket
+  next changes. Like
+  the notice read below it stores nothing and sends no filter field, though it is priced as a
+  write. A connection the board refuses it (a read-only token, or a server that predates it)
+  keeps the earlier way: one `get` per watched ticket every poll, and ticket replies still
+  wake the chat; `/inbox resume` asks again. A ticket without a project is read with `get`
+  as well. No watched tickets and no waiting approval, no calls. A rate-limit answer
   waits as long as the server says. A ticket that no longer exists is dropped.
 - **Ignores** the chat's own messages, its evidence and overflow notes, and board
   automation (`system` authors).

@@ -64,6 +64,13 @@ export type Watched = {
   watchedAt: number
   lastWakeAt: number | null
   pending: Pending[]
+  /**
+   * The newest `changed_at` the watch list named for this ticket whose `get` then
+   * succeeded (HO-19546). Only the watch read's own mark: `cursor` never moves from it.
+   */
+  mark?: string | null
+  /** The rev that came with `mark`. */
+  markRev?: number | null
 }
 
 export type InboxState = {
@@ -97,6 +104,13 @@ export type InboxState = {
   approvalsOff: boolean
   /** The rule-table revision the chat's own answers named; the notice read sends it. */
   guidanceRev: string | null
+  /**
+   * The board answers no watch list on this connection (read-only scope, or an older server):
+   * tickets are read one `get` each, as before HO-19546. Memory only: a new chat tries the list again.
+   */
+  watchReadOff: boolean
+  /** Per project: the approvals waiting on a person, as the last watch read counted them. Memory only. */
+  pendingProposals: Record<string, PendingProposals>
 }
 
 export function initialState(sessionId: string, now: number): InboxState {
@@ -121,6 +135,8 @@ export function initialState(sessionId: string, now: number): InboxState {
     noticeWalks: {},
     approvalsOff: false,
     guidanceRev: null,
+    watchReadOff: false,
+    pendingProposals: {},
   }
 }
 
@@ -929,16 +945,31 @@ export function applyBaseline(state: InboxState, ref: string, json: unknown): In
     watched: state.watched.map((w) => {
       if (!matches(w, ref) || !payload) return w
       const window = isRecord(payload.thread_window) ? payload.thread_window : {}
+      const cursor = typeof window.last_at === 'string' ? window.last_at : null
       return {
         ...w,
         id: typeof payload.id === 'string' ? payload.id : w.id,
         number: typeof payload.number === 'number' ? payload.number : w.number,
         projectId: w.projectId ?? projectOf(json),
-        cursor: typeof window.last_at === 'string' ? window.last_at : null,
+        cursor,
+        // The watch list's first position, from the server's own times (never this machine's clock).
+        mark: w.mark ?? baselineMark(payload, cursor),
         baselined: true,
       }
     }),
   }
+}
+
+/**
+ * The server time a ticket was last seen unchanged at baseline: the newer of its card's
+ * `updated_at` and its newest message, else the card's `created_at`; null when the answer
+ * carried none of them (watchPlan then falls back to the local clock, with a margin).
+ */
+function baselineMark(payload: Record<string, unknown>, lastMessageAt: string | null): string | null {
+  let newest = lastMessageAt
+  const updated = isoOrNull(payload.updated_at)
+  if (updated && newer(updated, newest)) newest = updated
+  return newest ?? isoOrNull(payload.created_at)
 }
 
 export type PollRequest = { projectId: string | null; ticketIds: string[]; since: string | null }
@@ -973,12 +1004,212 @@ export function getArgs(w: Watched, state: InboxState): Record<string, unknown> 
 /** Baseline = the same read as a poll: the cursor becomes the newest message seen. */
 export const baselineArgs = getArgs
 
-/** One request per baselined ticket; `since` is only the client-side cursor. */
-export function pollPlan(state: InboxState): PollRequest[] {
+/**
+ * One request per baselined ticket; `since` is only the client-side cursor.
+ * `unprojected`: only the tickets the watch list cannot cover (it needs a project).
+ */
+export function pollPlan(state: InboxState, scope: 'all' | 'unprojected' = 'all'): PollRequest[] {
   return state.watched
-    .filter((w) => w.baselined)
+    .filter((w) => w.baselined && (scope === 'all' || !w.projectId))
     .map((w) => ({ projectId: w.projectId, ticketIds: [w.id ?? w.ref], since: w.cursor }))
 }
+
+// ── one call for every watched ticket: `message` notify_config watch (HO-19546) ──
+// The board names which watched tickets changed since a time; only those are read
+// with `get`. What `changed` names never moves a ticket's message cursor: that
+// moves only from the messages a `get` returned (applyWindow). A ticket's `mark`
+// (changed_at) and `markRev` move once its `get` was applied, so a failed read is
+// named again next tick. `since` is always sent (the server refuses `watch` without
+// it) and reaches back WATCH_OVERLAP_MS before the oldest mark, so a message that
+// committed after an earlier `get` is still named; the (changed_at, rev) pair then
+// keeps the entries already read from being read again.
+
+/** The server's cap on `watch` refs per call; MAX_WATCHED is far below it. */
+export const WATCH_REFS_MAX = 50
+
+/** `since` reaches back this far before the oldest mark: a message may commit after the `get` that set it. */
+export const WATCH_OVERLAP_MS = 5_000
+const EPOCH = new Date(0).toISOString()
+
+export type WatchRequest = { projectId: string; refs: string[]; since: string }
+export type PendingProposals = { n: number; oldestAt: string | null; url: string | null }
+export type ChangedTicket = { ref: string; rev: number | null; stage: string | null; changedAt: string | null }
+export type WatchAnswer = {
+  changed: ChangedTicket[]
+  unknown: string[]
+  pending: PendingProposals | null
+  /** The answer left these parts out (a capped or failed read): absent is not zero. */
+  incomplete: string[]
+  /** The server's own time, taken before its reads (`as_of`); null from an older server. */
+  asOf: string | null
+}
+/** One `get` to make, and the watch entry that asked for it (none: a plain per-ticket poll). */
+export type TicketRead = { req: PollRequest; ref: string | null; changedAt: string | null; rev: number | null }
+
+/** The server time `overlap` ms before `ts` (millisecond precision, as the server compares); the epoch when `ts` is no time. */
+function reachBack(ts: string, overlap: number): string {
+  const ms = Math.floor(tsKey(ts) / 1000) - overlap
+  return Number.isFinite(ms) ? new Date(Math.max(0, ms)).toISOString() : EPOCH
+}
+
+/**
+ * Last resort when the server gave a ticket no time at all: when the watch began on this machine's
+ * clock, less the margin the notice read already allows for a clock that runs ahead of the server's.
+ */
+function localFloor(watchedAt: number): string {
+  return Number.isFinite(watchedAt) ? new Date(Math.max(0, watchedAt - NOTICE_SINCE_MARGIN_MS)).toISOString() : EPOCH
+}
+
+/**
+ * One watch call per project holding a baselined ticket. `since` is the oldest of their marks
+ * (else cursor, else the local floor) less the overlap: never absent, the server refuses `watch`
+ * without it. Marks start at baseline from the server's own times and move with the reads and
+ * with {@link advanceQuiet}, so one quiet ticket does not hold `since` back.
+ */
+export function watchPlan(state: InboxState): WatchRequest[] {
+  const byProject = new Map<string, Watched[]>()
+  for (const w of state.watched) {
+    if (w.baselined && w.projectId) byProject.set(w.projectId, [...(byProject.get(w.projectId) ?? []), w])
+  }
+  return [...byProject].map(([projectId, list]) => {
+    // Only a ticket the server gave no time at all (no card time, no message) falls back to this machine's clock.
+    const marks = list.map((w) => w.mark ?? w.cursor ?? localFloor(w.watchedAt))
+    const oldest = marks.reduce((o, m) => (tsKey(m) < tsKey(o) ? m : o))
+    const since = reachBack(oldest, WATCH_OVERLAP_MS)
+    return { projectId, refs: list.map(labelOf).slice(0, WATCH_REFS_MAX), since }
+  })
+}
+
+export function watchArgs(req: WatchRequest, state: InboxState): Record<string, unknown> {
+  return {
+    guidance_rev: state.guidanceRev ?? 'unknown',
+    project_id: req.projectId,
+    agent_id: agentIdOf(state.sessionId),
+    op: { action: 'notify_config', watch: req.refs, since: req.since },
+  }
+}
+
+/** A portal link worth showing: https, no spaces or control characters. */
+const safeUrl = (v: unknown): string | null =>
+  typeof v === 'string' && v.length <= 300 && /^https:\/\/[^\s\u0000-\u001f\u007f-\u009f]+$/.test(v) ? v : null
+
+/**
+ * A watch answer (`{card: {changed, unknown, pending_proposals}}` or the same flat),
+ * or null when it carries no `changed` list: a server that does not know `watch`.
+ */
+export function watchIn(json: unknown): WatchAnswer | null {
+  const holder = isRecord(json) && isRecord(json.card) ? json.card : json
+  if (!isRecord(holder) || !Array.isArray(holder.changed)) return null
+  const changed = holder.changed.flatMap((c): ChangedTicket[] => {
+    const ref = isRecord(c) ? normalizeRef(c.ref) : null
+    if (!isRecord(c) || !ref) return []
+    return [
+      {
+        ref,
+        rev: typeof c.rev === 'number' ? c.rev : null,
+        stage: typeof c.stage === 'string' ? c.stage : null,
+        // Without a valid time the ticket is still read; it just cannot be marked.
+        changedAt: isoOrNull(c.changed_at),
+      },
+    ]
+  })
+  const unknown = Array.isArray(holder.unknown) ? holder.unknown.flatMap((r) => normalizeRef(r) ?? []) : []
+  const p = isRecord(holder.pending_proposals) ? holder.pending_proposals : null
+  const pending: PendingProposals | null =
+    p && typeof p.n === 'number' && Number.isInteger(p.n) && p.n > 0
+      ? { n: p.n, oldestAt: isoOrNull(p.oldest_at), url: safeUrl(p.url) }
+      : null
+  const incomplete = Array.isArray(holder.incomplete) ? holder.incomplete.filter((x): x is string => typeof x === 'string') : []
+  const asOf = isoOrNull(holder.as_of) ?? (isRecord(json) ? isoOrNull(json.as_of) : null)
+  return { changed, unknown, pending, incomplete, asOf }
+}
+
+/**
+ * Remember how many approvals wait on a person in this project (none: forget it).
+ * An answer that names the count `incomplete` (the read was capped or failed) says nothing
+ * about it: the last count stays.
+ */
+export function applyWatchAnswer(state: InboxState, projectId: string, answer: WatchAnswer): InboxState {
+  if (!answer.pending && answer.incomplete.includes('pending_proposals')) return state
+  const { [projectId]: _, ...rest } = state.pendingProposals
+  return { ...state, pendingProposals: answer.pending ? { ...rest, [projectId]: answer.pending } : rest }
+}
+
+/**
+ * The tickets this call asked about and the board did not name were unchanged up to the time it
+ * answered: their marks move to the reply's `as_of` (the server's clock, read before its reads), so a
+ * quiet ticket stops pinning `since` at its baseline. An older server sends no `as_of`: then the newest
+ * `changed_at` it did name, a lower bound on its time. This machine's clock is never used. A named
+ * ticket (read or not) and an unknown one keep their marks.
+ */
+export function advanceQuiet(state: InboxState, req: WatchRequest, answer: WatchAnswer): InboxState {
+  let at = answer.asOf
+  if (!at) for (const c of answer.changed) if (c.changedAt && newer(c.changedAt, at)) at = c.changedAt
+  const to = at
+  if (!to) return state
+  const named = (w: Watched) => answer.changed.some((c) => matches(w, c.ref)) || answer.unknown.some((u) => matches(w, u))
+  let moved = false
+  const watched = state.watched.map((w) => {
+    if (w.projectId !== req.projectId || !w.baselined || !req.refs.includes(labelOf(w)) || named(w)) return w
+    if (!newer(to, w.mark ?? null)) return w
+    moved = true
+    return { ...w, mark: to }
+  })
+  return moved ? { ...state, watched } : state
+}
+
+/**
+ * Whether the stored (changed_at, rev) pair already covers this entry. With a rev on both sides the
+ * rev decides alongside the time (a late-committed message bumps it while changed_at may not be newer);
+ * without one, the time alone. Known limit: a message alone carries no rev, so a message that commits late
+ * with a created_at at or below the mark keeps the same (changed_at, rev) and is not re-read until the
+ * ticket next changes.
+ */
+function covered(w: Watched, c: ChangedTicket): boolean {
+  if (!c.changedAt || !w.mark || newer(c.changedAt, w.mark)) return false
+  return c.rev === null || w.markRev == null || c.rev <= w.markRev
+}
+
+/** The tickets a watch answer names as changed, each once: a `get` apiece, minus any already read past that change. */
+export function changedReads(state: InboxState, changed: readonly ChangedTicket[]): TicketRead[] {
+  const reads: TicketRead[] = []
+  for (const c of changed) {
+    const w = state.watched.find((x) => x.baselined && matches(x, c.ref))
+    if (!w || reads.some((r) => r.ref !== null && matches(w, r.ref))) continue
+    if (covered(w, c)) continue
+    reads.push({ req: { projectId: w.projectId, ticketIds: [w.id ?? w.ref], since: w.cursor }, ref: c.ref, changedAt: c.changedAt, rev: c.rev })
+  }
+  return reads
+}
+
+/** A plain per-ticket poll as a read. */
+export const plainRead = (req: PollRequest): TicketRead => ({ req, ref: null, changedAt: null, rev: null })
+
+/** The ticket's `get` succeeded: the watch list need not name that change again. The message cursor stays. */
+export function markRead(state: InboxState, read: TicketRead): InboxState {
+  const { ref, changedAt, rev } = read
+  if (!ref || !changedAt) return state
+  return {
+    ...state,
+    watched: state.watched.map((w) => {
+      if (!matches(w, ref)) return w
+      const mark = newer(changedAt, w.mark ?? null) ? changedAt : w.mark
+      const markRev = Math.max(w.markRev ?? 0, rev ?? 0) || null
+      return mark === w.mark && markRev === (w.markRev ?? null) ? w : { ...w, mark, markRev }
+    }),
+  }
+}
+
+/** The watch list is unavailable on this connection: read tickets one `get` each from now on. */
+export const stopWatchReads = (state: InboxState): InboxState => ({ ...state, watchReadOff: true })
+
+/**
+ * The watch call can never work on this connection: a scope refusal (read-only token), or the
+ * older server's OP_INVALID naming `watch` or `since`. Every other refusal fails this
+ * tick's read for that project only.
+ */
+export const watchRefused = (text: string): boolean =>
+  isScopeRefusal(text) || (refusalOf(text)?.code === 'OP_INVALID' && /\b(?:watch|since)\b/i.test(text))
 
 export function pollArgs(req: PollRequest, state: InboxState): Record<string, unknown> {
   return {
@@ -1011,6 +1242,9 @@ export function ticketFromCard(json: unknown): Record<string, unknown> | null {
     ...(typeof card.id === 'string' && { id: card.id }),
     ...(number !== null && { number }),
     ...(typeof card.project_id === 'string' && { project_id: card.project_id }),
+    // The server's own times for the ticket, when the card carries them (the watch list's first mark).
+    ...(isoOrNull(card.updated_at) !== null && { updated_at: card.updated_at }),
+    ...(isoOrNull(card.created_at) !== null && { created_at: card.created_at }),
     thread,
     thread_window: { last_at: last },
   }
@@ -1211,7 +1445,7 @@ export const AUTH_TOAST =
   'AppHandoff inbox: sign-in failed 3 times — polling stopped. It resumes after this chat’s next successful AppHandoff call.'
 
 export function resume(state: InboxState): InboxState {
-  return { ...state, paused: null, wakeTimes: [], approvalsOff: false }
+  return { ...state, paused: null, wakeTimes: [], approvalsOff: false, watchReadOff: false }
 }
 
 // ── polling health ───────────────────────────────────────────────────────
@@ -1323,6 +1557,12 @@ export function describe(state: InboxState, now: number): string {
         `  ${drivenLabel(d)} followed: ${d.settled ? `${drivenVerb(d)} · last wake ${ago(now, d.lastWakeAt)}` : `waiting since ${ago(now, d.touchedAt)}`}`,
     ),
     ...(state.approvalsOff ? ['approval wakes: off — the board refuses this connection the notice list (/inbox resume tries again)'] : []),
+    ...(state.watchReadOff && state.watched.length > 0
+      ? ['ticket reads: one get per ticket — the board answers no watch list on this connection (/inbox resume tries again)']
+      : []),
+    ...Object.values(state.pendingProposals).map(
+      (p) => `waiting on a person: ${p.n} approval(s)${p.oldestAt ? ` · oldest ${p.oldestAt}` : ''}${p.url ? ` · ${p.url}` : ''}`,
+    ),
     `last poll: ${ago(now, state.lastPollAt)} · add-on calls this chat: ${state.calls} · wakes this hour: ${state.wakeTimes.filter((t) => now - t < HOUR_MS).length}/${HOURLY_WAKES}`,
     `last error: ${state.lastError ?? 'none'}`,
   ]
