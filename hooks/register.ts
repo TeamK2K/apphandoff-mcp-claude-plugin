@@ -11,7 +11,10 @@
 // that call reads every ticket with `get`, as before. Before it wakes the chat for a new message it
 // claims the ticket for the chat (HO-19659: the plugin's one board write, under the chat's own
 // agent id; another agent's lease means no wake), and it wakes the chat when a person answers
-// a board question the chat asked. Every decision
+// a board question the chat asked. `/inbox standby <project ids>` (HO-19660) makes a chat a standing
+// inbox: it claims, one a poll, a message nobody answered six minutes after it was posted
+// and wakes the chat for it (a board question for a person's message, a reply-only wake for an outside
+// agent's). Every decision
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
@@ -54,7 +57,8 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
 
 /**
  * One `message` notify_config read: the notice list (HO-17707, include_missed) or
- * the watch list (HO-19546), or (`tool` ticket) the claim before a wake (HO-19659).
+ * the watch list (HO-19546), or (`tool` ticket) the claim before a wake (HO-19659), or (`tool` question)
+ * the standing inbox's open-question check (HO-19660).
  * `answers` says whether a JSON body is the answer asked for. A GUIDANCE_STALE
  * refusal hands back the current revision: one retry with it. A refusal answered
  * as a plain result is a failure too.
@@ -64,7 +68,7 @@ async function callNotify(
   server: string,
   argsOf: (s: core.InboxState) => Record<string, unknown>,
   answers: (json: unknown) => boolean,
-  tool: 'message' | 'ticket' = 'message',
+  tool: 'message' | 'ticket' | 'question' = 'message',
 ): Promise<Answer> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!state) return { ok: false, text: 'inbox stopped' }
@@ -96,11 +100,13 @@ async function readNotices(
   req: core.NoticeRequest,
   now: number,
 ): Promise<
-  { ok: true; decided: core.ApprovalWait[]; settled: core.DrivenMilestone[]; answered: core.QuestionWait[] } | { ok: false; text: string }
+  | { ok: true; decided: core.ApprovalWait[]; settled: core.DrivenMilestone[]; answered: core.QuestionWait[]; standbyStopped: boolean }
+  | { ok: false; text: string }
 > {
   const decided: core.ApprovalWait[] = []
   const settled: core.DrivenMilestone[] = []
   const answered: core.QuestionWait[] = []
+  let standbyStopped = false
   const walk = state?.noticeWalks[req.projectId ?? '']
   let newest: string | null = walk?.newest ?? null
   let before: string | undefined = walk?.before
@@ -118,7 +124,9 @@ async function readNotices(
     decided.push(...applied.decided)
     settled.push(...applied.settled)
     answered.push(...applied.answered)
+    standbyStopped ||= applied.standbyStopped
     const waiting =
+      (state.standby?.projects.includes(req.projectId ?? '') ?? false) ||
       state.approvals.some((a) => a.decided === null && a.projectId === req.projectId) ||
       state.driven.some((d) => d.settled === null && d.projectId === req.projectId) ||
       state.questions.some((q) => q.answered === null && q.projectId === req.projectId)
@@ -129,7 +137,7 @@ async function readNotices(
     before = list.nextBefore
   }
   if (state) state = core.endNoticeWalk(state, req.projectId, newest, finished ? null : (before ?? null))
-  return { ok: true, decided, settled, answered }
+  return { ok: true, decided, settled, answered, standbyStopped }
 }
 
 /**
@@ -268,6 +276,72 @@ async function readTickets($: EngineInterface, server: string, reads: core.Ticke
   }
 }
 
+/** Submit a wake prompt; once it enters (or never does) settle (or abort) what it named. Fire and forget. */
+function submitWake($: EngineInterface, text: string, decidedAt: number) {
+  $.prompt
+    .submit({ text })
+    .then(
+      (r) => !('drop' in r && r.drop !== undefined),
+      () => false,
+    )
+    .then(async (entered) => {
+      if (!state) return
+      state = entered ? core.settleWake(state, decidedAt) : core.abortWake(state)
+      if (!entered) $.ui.toast('AppHandoff inbox: the wake did not reach the chat — will retry')
+      show($)
+      await save($)
+    })
+    .catch(() => undefined)
+}
+
+/**
+ * The standing inbox's one claim a poll (HO-19660): the oldest waiting message that has waited out the owning
+ * chat's head start. An open board question on its ticket settles it without a claim; a lease someone else holds
+ * settles it too (they are on it); a claim that lands wakes the chat (core.standbyWakeText). One message that keeps
+ * failing is given up on after a few polls, so it never blocks the rest.
+ */
+async function standbyStep($: EngineInterface, server: string) {
+  if (!state?.standby) return
+  const noted = core.noteStandbyCap(state, await $.clock.now())
+  state = noted.state
+  if (noted.toast) $.ui.toast(noted.toast)
+  let checks = 0
+  for (const c of core.standbyDue(state, await $.clock.now())) {
+    if (!state?.standby || checks++ >= core.STANDBY_CHECKS_PER_POLL) return
+    const asked = await callNotify($, server, (s) => core.standbyQuestionArgs(c, s), () => false, 'question')
+    if (!state?.standby) return
+    // A refusal for good (this message's ticket cannot be read) settles the message and the loop goes on.
+    if (!asked.ok && (core.isLastingRefusal(asked.text) || core.isScopeRefusal(asked.text))) {
+      state = core.standbyHandled(state, [c])
+      continue
+    }
+    const open = asked.ok ? core.openQuestionsIn(asked.json) : null
+    if (open === null) {
+      // A failure in passing: counted against the message (given up on after a few), the poll ends.
+      const text = asked.ok ? 'question list returned no list' : asked.text
+      const at = await $.clock.now()
+      await failed($, text, at)
+      if (state?.standby) state = core.applyStandbyClaim(state, c, { kind: 'retry', text }, at).state
+      return
+    }
+    if (open) {
+      state = core.standbyHandled(state, [c])
+      continue
+    }
+    const claimAt = await $.clock.now()
+    const r = await callNotify($, server, (s) => core.standbyClaimArgs(c, s), () => false, 'ticket')
+    if (!state?.standby) return
+    const outcome = core.claimOutcome(state.sessionId, r, claimAt)
+    if (outcome.kind === 'retry') await failed($, outcome.text, claimAt)
+    if (!state?.standby) return
+    const applied = core.applyStandbyClaim(state, c, outcome, claimAt)
+    state = applied.state
+    if (applied.toast) $.ui.toast(applied.toast)
+    if (applied.wake) submitWake($, core.standbyWakeText(applied.wake, state.sessionId, applied.claimed), claimAt)
+    return
+  }
+}
+
 /** One poll: baseline new watches, read what changed on the watched threads, maybe wake. */
 async function tick($: EngineInterface) {
   if (polling || !state || off) return
@@ -316,10 +390,12 @@ async function tick($: EngineInterface) {
         decided.push(...r.decided)
         settled.push(...r.settled)
         answered.push(...r.answered)
+        if (r.standbyStopped) $.ui.toast(core.STANDBY_OLD_SERVER_TOAST)
         continue
       }
       if (core.isScopeRefusal(r.text) || core.isLastingRefusal(r.text)) {
         if (!state.approvalsOff) $.ui.toast(core.isScopeRefusal(r.text) ? core.APPROVALS_OFF_TOAST : core.approvalsRefusedToast(r.text))
+        if (state.standby) $.ui.toast(core.STANDBY_NOTICES_OFF_TOAST)
         state = core.approvalsOff(state)
         break
       }
@@ -370,21 +446,10 @@ async function tick($: EngineInterface) {
     state = d.state
     if (d.tripped) $.ui.toast(core.LIMIT_TOAST)
     if (d.wake || d.approvals.length > 0 || d.driven.length > 0 || d.questions.length > 0) {
-      $.prompt
-        .submit({ text: core.wakePrompt(d.wake, d.approvals, state.sessionId, d.driven, d.questions) })
-        .then(
-          (r) => !('drop' in r && r.drop !== undefined),
-          () => false,
-        )
-        .then(async (entered) => {
-          if (!state) return
-          state = entered ? core.settleWake(state, decidedAt) : core.abortWake(state)
-          if (!entered) $.ui.toast('AppHandoff inbox: the wake did not reach the chat — will retry')
-          show($)
-          await save($)
-        })
-        .catch(() => undefined)
+      submitWake($, core.wakePrompt(d.wake, d.approvals, state.sessionId, d.driven, d.questions), decidedAt)
     }
+    // The standing inbox (HO-19660) acts only when nothing else is waking the chat this tick.
+    await standbyStep($, server)
   } catch (err) {
     if (state) state = { ...state, lastError: err instanceof Error ? err.message : String(err) }
   } finally {
@@ -411,8 +476,8 @@ export const register: Register = (on) => {
     try {
       await $.command.register({
         name: 'inbox',
-        description: 'AppHandoff inbox: what this chat watches; pause or resume wakes',
-        argumentHint: '[pause|resume]',
+        description: 'AppHandoff inbox: what this chat watches; pause or resume wakes; standby makes this chat a standing inbox',
+        argumentHint: '[pause|resume|standby <project ids>|standby off]',
       })
     } catch {}
     try {
@@ -470,7 +535,13 @@ export const register: Register = (on) => {
         state = core.resume(state)
         schedule($, 1_000)
       }
-      if (command === 'unknown') return { text: 'inbox: usage /inbox [pause|resume]' }
+      if (command === 'standby') {
+        const req = core.parseStandby(e.args)
+        if (req.action === 'invalid') return { text: core.STANDBY_USAGE }
+        state = req.action === 'off' ? core.stopStandby(state) : core.startStandby(state, req.projects, now)
+        schedule($, 1_000)
+      }
+      if (command === 'unknown') return { text: `inbox: usage /inbox [pause|resume|standby <project ids>|standby off]` }
       show($)
       await save($)
       return { text: core.describe(state, now) }
