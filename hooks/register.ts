@@ -8,7 +8,10 @@
 // (HO-19052: followed from its own plan calls, no proposal of its own). Watched
 // tickets are polled with one `message` notify_config watch call per project, then
 // one `get` per ticket it names as changed (HO-19546); a connection that cannot make
-// that call reads every ticket with `get`, as before. Every decision
+// that call reads every ticket with `get`, as before. Before it wakes the chat for a new message it
+// claims the ticket for the chat (HO-19659: the plugin's one board write, under the chat's own
+// agent id; another agent's lease means no wake), and it wakes the chat when a person answers
+// a board question the chat asked. Every decision
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
@@ -51,22 +54,24 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
 
 /**
  * One `message` notify_config read: the notice list (HO-17707, include_missed) or
- * the watch list (HO-19546). `answers` says whether a JSON body is the answer
- * asked for. A GUIDANCE_STALE refusal hands back the current revision: one retry
- * with it. A refusal answered as a plain result is a failure too.
+ * the watch list (HO-19546), or (`tool` ticket) the claim before a wake (HO-19659).
+ * `answers` says whether a JSON body is the answer asked for. A GUIDANCE_STALE
+ * refusal hands back the current revision: one retry with it. A refusal answered
+ * as a plain result is a failure too.
  */
 async function callNotify(
   $: EngineInterface,
   server: string,
   argsOf: (s: core.InboxState) => Record<string, unknown>,
   answers: (json: unknown) => boolean,
+  tool: 'message' | 'ticket' = 'message',
 ): Promise<Answer> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!state) return { ok: false, text: 'inbox stopped' }
     state = { ...state, calls: state.calls + 1 }
     let text: string
     try {
-      const r = await $.mcp.call(server, 'message', argsOf(state))
+      const r = await $.mcp.call(server, tool, argsOf(state))
       const json = core.v3Json(r.structuredContent, firstTextOf(r)) ?? core.parseJson(textOf(r))
       if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !answers(json))) return { ok: true, json }
       text = textOf(r) || JSON.stringify(json ?? 'message failed')
@@ -90,9 +95,12 @@ async function readNotices(
   server: string,
   req: core.NoticeRequest,
   now: number,
-): Promise<{ ok: true; decided: core.ApprovalWait[]; settled: core.DrivenMilestone[] } | { ok: false; text: string }> {
+): Promise<
+  { ok: true; decided: core.ApprovalWait[]; settled: core.DrivenMilestone[]; answered: core.QuestionWait[] } | { ok: false; text: string }
+> {
   const decided: core.ApprovalWait[] = []
   const settled: core.DrivenMilestone[] = []
+  const answered: core.QuestionWait[] = []
   const walk = state?.noticeWalks[req.projectId ?? '']
   let newest: string | null = walk?.newest ?? null
   let before: string | undefined = walk?.before
@@ -109,9 +117,11 @@ async function readNotices(
     state = applied.state
     decided.push(...applied.decided)
     settled.push(...applied.settled)
+    answered.push(...applied.answered)
     const waiting =
       state.approvals.some((a) => a.decided === null && a.projectId === req.projectId) ||
-      state.driven.some((d) => d.settled === null && d.projectId === req.projectId)
+      state.driven.some((d) => d.settled === null && d.projectId === req.projectId) ||
+      state.questions.some((q) => q.answered === null && q.projectId === req.projectId)
     if (!list.truncated || !list.nextBefore || !waiting) {
       finished = true
       break
@@ -119,7 +129,24 @@ async function readNotices(
     before = list.nextBefore
   }
   if (state) state = core.endNoticeWalk(state, req.projectId, newest, finished ? null : (before ?? null))
-  return { ok: true, decided, settled }
+  return { ok: true, decided, settled, answered }
+}
+
+/**
+ * The claim before a wake (HO-19659): `ticket {op: claim}` under the chat's own agent id, so the
+ * lease holder is the chat's and its own later claim renews it. What the answer means for the
+ * wake is core.claimOutcome's; a passing failure counts like a failed poll, toasted once per ticket.
+ */
+async function claimBeforeWake($: EngineInterface, server: string, w: core.Watched, now: number): Promise<core.ClaimOutcome> {
+  // No answer body is "the answer asked for" here: any coded body is a refusal for claimOutcome to read.
+  const r = await callNotify($, server, (s) => core.claimArgs(w, s), () => false, 'ticket')
+  const outcome = core.claimOutcome(state?.sessionId ?? '', r, now)
+  if (outcome.kind === 'retry' && state) {
+    const f = core.claimFailed(state, w, outcome.text, now)
+    state = f.state
+    if (f.toast) $.ui.toast(f.toast)
+  }
+  return outcome
 }
 
 async function save($: EngineInterface) {
@@ -281,12 +308,14 @@ async function tick($: EngineInterface) {
     // Milestone approvals this chat asked for: one notice read per project while one waits.
     const decided: core.ApprovalWait[] = []
     const settled: core.DrivenMilestone[] = []
+    const answered: core.QuestionWait[] = []
     for (const req of core.noticePlan(state)) {
       const r = await readNotices($, server, req, now)
       if (!state) return
       if (r.ok) {
         decided.push(...r.decided)
         settled.push(...r.settled)
+        answered.push(...r.answered)
         continue
       }
       if (core.isScopeRefusal(r.text) || core.isLastingRefusal(r.text)) {
@@ -302,6 +331,7 @@ async function tick($: EngineInterface) {
 
     for (const a of decided) $.ui.toast(core.approvalToastText(a))
     for (const d of settled) $.ui.toast(core.drivenToastText(d))
+    for (const q of answered) $.ui.toast(core.questionToastText(q))
     for (const f of fresh.slice(0, 3)) $.ui.toast(core.toastText(f))
     if (fresh.length > 3) $.ui.toast(`AppHandoff inbox: ${fresh.length - 3} more new message(s)`)
 
@@ -309,13 +339,39 @@ async function tick($: EngineInterface) {
     // us; give that result a moment so decideWake can drop the chat's own id.
     if (fresh.length > 0) await $.clock.sleep(core.OWN_WRITE_SETTLE_MS)
 
+    // Claim each ticket a wake would name for the chat (HO-19659) before waking it: someone else's
+    // lease means no wake; a claim that failed in passing holds that ticket's wake to the next tick.
+    const hold: string[] = []
+    if (!state) return
+    let claimsStopped = false
+    for (const w of core.claimTargets(state, await $.clock.now())) {
+      const claimAt = await $.clock.now()
+      // A sign-in failure or rate limit ends this tick's claims; the rest wait for the next tick.
+      if (claimsStopped) {
+        if (core.claimHoldsWake(w, claimAt)) hold.push(core.labelOf(w))
+        continue
+      }
+      const outcome = await claimBeforeWake($, server, w, claimAt)
+      if (!state) return
+      if (outcome.kind === 'retry') {
+        if (core.claimHoldsWake(w, claimAt)) hold.push(core.labelOf(w))
+        claimsStopped = state.authStopped || state.retryAt !== null
+        continue
+      }
+      const applied = core.applyClaim(state, w.ref, outcome, claimAt)
+      state = applied.state
+      if (applied.toast) $.ui.toast(applied.toast)
+    }
+    if (!state) return
+    state = core.pruneClaimToasts(state, hold)
+
     const decidedAt = await $.clock.now()
-    const d = core.decideWake(state, decidedAt)
+    const d = core.decideWake(state, decidedAt, hold)
     state = d.state
     if (d.tripped) $.ui.toast(core.LIMIT_TOAST)
-    if (d.wake || d.approvals.length > 0 || d.driven.length > 0) {
+    if (d.wake || d.approvals.length > 0 || d.driven.length > 0 || d.questions.length > 0) {
       $.prompt
-        .submit({ text: core.wakePrompt(d.wake, d.approvals, state.sessionId, d.driven) })
+        .submit({ text: core.wakePrompt(d.wake, d.approvals, state.sessionId, d.driven, d.questions) })
         .then(
           (r) => !('drop' in r && r.drop !== undefined),
           () => false,
