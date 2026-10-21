@@ -5,7 +5,10 @@
 // when a person decides a milestone approval it asked for (HO-17707: read
 // from the board's notice list, the catch-up every IDE reads), and when a
 // person accepts or drops a milestone this chat or its builders worked on
-// (HO-19052: followed from its own plan calls, no proposal of its own). Every decision
+// (HO-19052: followed from its own plan calls, no proposal of its own). Watched
+// tickets are polled with one `message` notify_config watch call per project, then
+// one `get` per ticket it names as changed (HO-19546); a connection that cannot make
+// that call reads every ticket with `get`, as before. Every decision
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
@@ -47,19 +50,25 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
 }
 
 /**
- * One notice-list read (HO-17707): `message` notify_config include_missed. A
- * GUIDANCE_STALE refusal hands back the current revision: one retry with it.
- * A refusal answered as a plain result is a failure too.
+ * One `message` notify_config read: the notice list (HO-17707, include_missed) or
+ * the watch list (HO-19546). `answers` says whether a JSON body is the answer
+ * asked for. A GUIDANCE_STALE refusal hands back the current revision: one retry
+ * with it. A refusal answered as a plain result is a failure too.
  */
-async function callNotices($: EngineInterface, server: string, req: core.NoticeRequest): Promise<Answer> {
+async function callNotify(
+  $: EngineInterface,
+  server: string,
+  argsOf: (s: core.InboxState) => Record<string, unknown>,
+  answers: (json: unknown) => boolean,
+): Promise<Answer> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!state) return { ok: false, text: 'inbox stopped' }
     state = { ...state, calls: state.calls + 1 }
     let text: string
     try {
-      const r = await $.mcp.call(server, 'message', core.noticeArgs(req, state))
+      const r = await $.mcp.call(server, 'message', argsOf(state))
       const json = core.v3Json(r.structuredContent, firstTextOf(r)) ?? core.parseJson(textOf(r))
-      if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !core.noticesIn(json))) return { ok: true, json }
+      if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !answers(json))) return { ok: true, json }
       text = textOf(r) || JSON.stringify(json ?? 'message failed')
     } catch (err) {
       return { ok: false, text: err instanceof Error ? err.message : String(err) }
@@ -89,7 +98,8 @@ async function readNotices(
   let before: string | undefined = walk?.before
   let finished = false
   for (let page = 0; page < core.NOTICE_PAGES; page++) {
-    const r = await callNotices($, server, before ? { ...req, before } : req)
+    const asked = before ? { ...req, before } : req
+    const r = await callNotify($, server, (s) => core.noticeArgs(asked, s), (j) => core.noticesIn(j) !== null)
     if (!r.ok) return r
     const list = core.noticesIn(r.json)
     if (!list) return { ok: false, text: 'notify_config returned no notice list' }
@@ -157,7 +167,81 @@ async function failed($: EngineInterface, text: string, now: number) {
   else if (r.firstError) $.ui.toast(`AppHandoff inbox: poll failed — ${state.lastError}`)
 }
 
-/** One poll: baseline new watches, read every watched thread, maybe wake. */
+type Polled = { fresh: core.Fresh[]; failures: number; stop: boolean }
+
+/**
+ * The reads this tick owes. The watch list names the changed tickets, so a quiet
+ * board costs one call. A refusal for good (read-only scope, an older server) or an
+ * answer without the list ends the list for this connection: every ticket is read.
+ */
+async function planReads($: EngineInterface, server: string, now: number, out: Polled): Promise<core.TicketRead[]> {
+  if (!state) return []
+  const plain = (scope: 'all' | 'unprojected') => (state ? core.pollPlan(state, scope).map(core.plainRead) : [])
+  if (state.watchReadOff) return plain('all')
+  const reads = plain('unprojected')
+  for (const req of core.watchPlan(state)) {
+    const r = await callNotify($, server, (s) => core.watchArgs(req, s), (j) => core.watchIn(j) !== null)
+    if (!state) return []
+    if (!r.ok && !core.watchRefused(r.text)) {
+      out.failures++
+      await failed($, r.text, now)
+      if (!state || state.authStopped || state.retryAt !== null) {
+        out.stop = true
+        return []
+      }
+      continue
+    }
+    const answer = r.ok ? core.watchIn(r.json) : null
+    if (!answer) {
+      state = core.stopWatchReads(state)
+      return plain('all')
+    }
+    state = core.advanceQuiet(core.applyWatchAnswer(state, req.projectId, answer), req, answer)
+    for (const ref of answer.unknown) {
+      const dropped = core.unwatch(state, ref)
+      if (dropped.removed) {
+        state = dropped.state
+        $.ui.toast(`AppHandoff inbox: ${ref} not found — not watching it`)
+      }
+    }
+    reads.push(...core.changedReads(state, answer.changed))
+  }
+  return reads
+}
+
+/** One `get` per read: a ticket that is gone is dropped, a failed read counts, the rest go on. */
+async function readTickets($: EngineInterface, server: string, reads: core.TicketRead[], now: number, out: Polled) {
+  for (const read of reads) {
+    if (!state) return
+    const r = await readThread($, server, core.pollArgs(read.req, state))
+    if (!state) return
+    // Every ref in the read is gone: drop them, keep polling the rest.
+    if (!r.ok && core.isNotFound(r.text)) {
+      for (const id of read.req.ticketIds) state = core.unwatch(state, id).state
+      $.ui.toast(`AppHandoff inbox: ${read.req.ticketIds.length} watched ticket(s) no longer found — not watching them`)
+      continue
+    }
+    if (!r.ok) {
+      out.failures++
+      await failed($, r.text, now)
+      if (!state || state.authStopped || state.retryAt !== null) {
+        out.stop = true
+        return
+      }
+      continue
+    }
+    const payloads = core.ticketPayloads(r.json)
+    for (const payload of payloads) {
+      const applied = core.applyWindow(state, payload, now)
+      state = applied.state
+      out.fresh.push(...applied.fresh)
+    }
+    // Marked only once a thread was applied: a get with no usable thread leaves the change to be named again.
+    if (payloads.length > 0) state = core.markRead(state, read)
+  }
+}
+
+/** One poll: baseline new watches, read what changed on the watched threads, maybe wake. */
 async function tick($: EngineInterface) {
   if (polling || !state || off) return
   polling = true
@@ -187,28 +271,13 @@ async function tick($: EngineInterface) {
       state = core.applyBaseline(state, w.ref, r.json)
     }
 
-    const fresh: core.Fresh[] = []
-    // One `get` per watched ticket.
-    for (const req of core.pollPlan(state)) {
-      const r = await readThread($, server, core.pollArgs(req, state))
-      // Every ref in the read is gone: drop them, keep polling the rest.
-      if (!r.ok && core.isNotFound(r.text)) {
-        for (const id of req.ticketIds) state = core.unwatch(state, id).state
-        $.ui.toast(`AppHandoff inbox: ${req.ticketIds.length} watched ticket(s) no longer found — not watching them`)
-        continue
-      }
-      if (!r.ok) {
-        failures++
-        await failed($, r.text, now)
-        if (!state || state.authStopped || state.retryAt !== null) return
-        continue
-      }
-      for (const payload of core.ticketPayloads(r.json)) {
-        const applied = core.applyWindow(state, payload, now)
-        state = applied.state
-        fresh.push(...applied.fresh)
-      }
-    }
+    // One watch call per project names the changed tickets; each is read with one `get`
+    // (all of them, one `get` apiece, when the board answers no watch list).
+    const polled: Polled = { fresh: [], failures: 0, stop: false }
+    await readTickets($, server, await planReads($, server, now, polled), now, polled)
+    if (polled.stop || !state) return
+    const fresh = polled.fresh
+    failures += polled.failures
     // Milestone approvals this chat asked for: one notice read per project while one waits.
     const decided: core.ApprovalWait[] = []
     const settled: core.DrivenMilestone[] = []
