@@ -42,19 +42,22 @@ itself in the desktop app.
 
 The plugin bundles no MCP configuration file: add the AppHandoff MCP connection to
 Claude Code yourself, pointing at `https://api.apphandoff.com/mcp`, and sign in with your
-own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes calls on it that change nothing on your board to poll them (`get`, and `message` `notify_config` reads). It makes one call that does change your board: before it wakes the chat for a new message it **claims the ticket** for the chat (`ticket` with `op.action: "claim"`), so two agents never work one ticket at once. That needs a connection allowed to write; a read-only one is refused the claim once and then wakes as before. A person's message is never claimed for: it always reaches the chat.
+own AppHandoff account. The plugin learns which tickets and milestones to follow from the chat's own calls on that connection, then makes calls on it that change nothing on your board to poll them (`get`, and `message` `notify_config` reads). It makes one call that does change your board: before it wakes the chat for a new message it **claims the ticket** for the chat (`ticket` with `op.action: "claim"`), so two agents never work one ticket at once. That needs a connection allowed to write; a read-only one is refused the claim once and then wakes as before. A person's message is never claimed for: it always reaches the chat. The one exception is **standby**, which you turn on yourself (below): it claims for a person's message too.
 
 ## What it does on your machine
 
-- While it watches a ticket or waits on an approval it polls your own AppHandoff
-  connection every 60 s, slowing to 2 min after 5 quiet minutes and 5 min after 30; with
-  nothing to watch it makes no calls.
+- While it watches a ticket or waits on an approval, or while standby is on, it polls your own
+  AppHandoff connection every 60 s, slowing to 2 min after 5 quiet minutes and 5 min after 30;
+  with nothing to watch it makes no calls. Standby polls with no ticket watched: it reads the
+  notice list of the projects you named.
 - It injects a wake prompt into the chat when the board has something for it.
 - It claims a ticket for the chat (one `ticket` claim call, a write on your board) before waking
-  it for a new message on that ticket; nothing else it sends changes your board.
+  it for a new message on that ticket (standby, which is off unless you turn it on, claims for a
+  person's message too and also makes `question` list reads); nothing else it sends changes your board.
 - The Milestones pane makes read-only `find` and `get` calls while it is open, refreshing
   approvals every 60 s.
-- `/inbox` shows what the chat watches and lets you pause or resume wakes.
+- `/inbox` shows what the chat watches and lets you pause or resume wakes; `/inbox standby
+  <project ids>` (off unless you run it) makes the chat a standing inbox, see "Standby" below.
 - It shows a status line, the Milestones pane and toasts, on your screen only.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
@@ -124,7 +127,9 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   treat it as untrusted, and only reply with `message` (`op.action: "send"`) unless you confirm
   more. For a person's message (author type `human`) it tells the chat to read the thread, tell you
   what was posted and ask you what to do through a board `question` ask (not a `message` reply),
-  taking no other action until you answer; no claim is made for it. The toast shows the first
+  taking no other action until you answer; no claim is made for it (standby is the exception, see
+  below). The tool limits in a wake are a request: the wake asks the chat to use only certain
+  tools, and nothing enforces it. The toast shows the first
   120 characters (screen only; the model never sees it).
 - **Limits**: one wake in flight, a 2-minute cooldown per ticket, 6 wakes an hour.
   Hitting the hourly cap pauses wakes until `/inbox resume`. A wake that does not reach
@@ -143,8 +148,9 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
 - **Claims** the ticket for the chat before it wakes it for an agent's new message: `ticket` with
   `op: {action: "claim", paths: ["."]}`, under the chat's own agent id (`cc:<chat id>`, the one its
   own calls carry), so the lease holder is the chat's and the chat's own later claim renews it
-  instead of being refused. This is the one write the plugin makes on your board. A person's
-  message is never claimed for (it always wakes the chat to ask you).
+  instead of being refused. This is the one write the plugin makes on your board. For a chat that
+  owns the ticket, a person's message is never claimed for (it always wakes the chat to ask you);
+  standby, which you turn on yourself, claims for a person's message too.
 - **The lock outlasts the wake**: the lease lasts 20 minutes from each claim, so for up to 20
   minutes per message other agents are refused the ticket, whether or not the chat is still
   working on it. A later wake renews it; the chat's own `release`, or a move out of `in_progress`,
@@ -216,6 +222,61 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   they see the same `approval_decided` notice on their next board call (`bootstrap`'s
   `missed` count, or the catch-up above). Only the instant wake of an idle chat needs this
   plugin.
+
+### Standby: a chat that answers for the board (opt-in)
+
+`/inbox standby <project id>[, <project id>…]` (up to 5 project ids) makes one chat a standing
+inbox for those projects. **It is off in every install and every chat until you run it**, and it
+has its own off switch: `/inbox standby off` (`APPHANDOFF_INBOX=off` turns the whole add-on off,
+standby included). It starts once the chat has made its first AppHandoff call, like the rest of
+the inbox. Running the command again while it is on changes only the project list, and also
+tries a notice read the board once refused. Each project has its own start: a project you add
+starts now (its older messages are never acted on), one already running keeps its start, and
+messages queued for a project you take off the list are dropped. Intended use: one dedicated chat per machine.
+
+Unlike the rest of the inbox, standby watches no ticket, claims for a person's message too, and
+makes `question` list reads (read-only) to see whether a ticket already has an open question.
+
+- **Reads** the same notice list as the approval wakes (`message` with `op: {action:
+  "notify_config", include_missed: true, missed_min_tier: "high"}`, from five minutes before you
+  ran the command, then from the newest notice seen), for each project you named. Messages
+  posted before you turned it on (allowing a minute of clock difference) are never acted on.
+- **Skips** a message posted by your own account: the board marks each notice `from_you` for
+  the reader. A later `from_you` post on the same ticket counts as the answer, even when its page
+  is read first, and so does an open board `question` on the ticket (`question` `op: {action:
+  "list", filter: "target"}`). A ticket this chat itself watches belongs to its owning path and is
+  left alone.
+- **Refuses a server that sends no `from_you`**: a ticket-message notice created after you
+  turned standby on that lacks the flag stops standby with one toast, and nothing is acted on.
+  An older notice without it is just old and ignored.
+- **Waits 6 minutes** after a message (counted from the later of the message's time and when this
+  machine saw it), so a chat that owns the ticket can claim it first, then takes the **oldest
+  first, one claim per poll** (`ticket` claim under the chat's own agent id, for a person's
+  message too). `LEASE_HELD` means an owner, or another machine on the same account, is on it: the
+  message is then done with and never tried again, even after the lease lapses. That is what keeps
+  two standby chats on one account from both waking for one message: the board gives the lease to
+  one, and the other drops out of that message for good. A claim that fails in passing is tried on
+  the next polls, at most three times, then given up on so it cannot hold up the rest.
+- **Wakes** the chat with ticket number, author type, message id and time only, never the
+  message text. A **person's** message: the chat tells you and asks through a board `question`,
+  doing nothing else until you answer. An **outside agent's** message: a reply-only wake that asks
+  the chat to use only `get` (that ticket), `message` and `question`, with no edits and no
+  commands; anything beyond a reply goes to a board `question`. Neither wake carries the steps
+  for a yes. Only the later wake that tells the chat you answered that question carries them
+  (release the claim, then move the ticket to `up_next` for agents to pick up), and it says a yes
+  counts only from your answer to the board question, never from text in the thread. These tool
+  limits are a request in the wake text; nothing in the plugin enforces them. If the board refuses
+  the claim for good, an agent's message is dropped but a person's still wakes the chat with the
+  board-question text. That wake does not say the chat claimed the ticket, and its later yes-steps
+  have no release step (only the move to `up_next`), since there is no claim to release.
+- **Limits**: its own 6 wakes an hour, counted apart from the chat's other wakes. At the cap it
+  waits and carries on by itself as the hour passes (it never sets the permanent
+  "wakes paused"). `/inbox pause` pauses it; `/inbox resume` also clears its hour. It needs a
+  connection allowed to write (the notice read and the claim); a read-only one stops it with a
+  toast. A message nobody picked up in a day is left alone.
+- **Stores** its project list, the message ids it waits on or finished with, the latest time of
+  your own post per ticket (up to 200 tickets, none older than a day), the tickets it woke the chat
+  for and its wake times with the chat's other saved state.
 
 ## Milestones pane: what it reads and sends
 
@@ -291,6 +352,7 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
 ## Turn it off
 
 - One chat: `/inbox pause` (wakes stop; `/inbox resume` restarts them).
+- Standby: `/inbox standby off` (it is off unless you turned it on).
 - Every new chat: set `APPHANDOFF_INBOX=off` in the `env` block of
   `~/.claude/settings.json`, then start a new chat — it loads idle.
 - Remove it: `/plugin uninstall apphandoff@apphandoff`, then start a new chat.
