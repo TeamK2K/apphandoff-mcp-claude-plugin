@@ -211,19 +211,24 @@ function ownIdsIn(tool: string, text: string, json: unknown): string[] {
   return ids
 }
 
-/** Tickets a `ticket.create` result created: objects with a UUID id and a number (or an HO ticket_ref). */
+/**
+ * Tickets a `ticket.create` result created: objects with a `number`, or a `ticket_ref` of the
+ * HO-n(-slug) form. The terse create card names only the slug-form `ticket_ref` (HO-19657);
+ * once it also carries a UUID `id` and `number`, the number wins.
+ */
 function createdTickets(json: unknown): string[] {
   const out: string[] = []
   const visit = (v: unknown, depth: number) => {
     if (depth > 3) return
     if (Array.isArray(v)) return v.forEach((x) => visit(x, depth + 1))
     if (!isRecord(v)) return
-    if (typeof v.id === 'string' && UUID.test(v.id)) {
-      const ref = typeof v.number === 'number' ? `HO-${v.number}` : normalizeRef(v.ticket_ref)
-      if (ref) {
-        out.push(ref)
-        return
-      }
+    const hasId = typeof v.id === 'string' && UUID.test(v.id)
+    // A bare number needs the UUID id (any object may carry a `number`); a ticket_ref is its own proof.
+    const ticketRef = typeof v.ticket_ref === 'string' && /^HO-\d/i.test(v.ticket_ref.trim()) ? normalizeRef(v.ticket_ref) : null
+    const ref = hasId && typeof v.number === 'number' ? `HO-${v.number}` : ticketRef
+    if (ref) {
+      out.push(ref)
+      return
     }
     for (const x of Object.values(v)) visit(x, depth + 1)
   }
@@ -388,15 +393,18 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
   }
 
   const evicted: string[] = []
-  if (scope === 'subagent') return { state: next, changed, authResumed, evicted }
   if (name.tool !== 'ticket' || call.args.dry_run === true) return { state: next, changed, authResumed, evicted }
   const op = isRecord(call.args.op) ? call.args.op : {}
   const ref = normalizeRef(call.args.ref)
   if (op.action === 'claim' && ref) {
+    // A builder's claim starts the chat's watch too (HO-19657): the chat spawned it and waits on its ticket.
     const r = watch(next, ref, projectHint(call.args, json), now)
     next = r.state
     evicted.push(...r.evicted)
     changed = true
+  } else if (scope === 'subagent' && op.action !== 'close') {
+    // A builder's release keeps the watch (the chat still waits on the ticket); its creates are not watched.
+    return { state: next, changed, authResumed, evicted }
   } else if (op.action === 'create') {
     for (const created of createdTickets(json)) {
       const r = watch(next, created, projectHint(call.args, json), now)

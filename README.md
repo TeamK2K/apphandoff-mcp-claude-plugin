@@ -93,9 +93,10 @@ Both add-ons use the same rule, from the chat's own calls (`mcp__<server>__<tool
   (`ticket` with `op.action: "claim"`) or created (`ticket` with `op.action: "create"`).
   Releasing the claim or closing the ticket stops the watch. It learns all of this from
   the chat's own AppHandoff calls as the transcript records them (on the connection
-  recognised above); it never wraps tool calls and never reads other tickets. A claim or ticket made by a subagent of the
-  chat is not watched — claim from the main chat; what a subagent posts is still
-  recognised as the chat's own, so it never wakes the chat.
+  recognised above); it never wraps tool calls and never reads other tickets. A subagent's
+  (builder's) successful claim starts the chat's watch on that ticket; the builder's release keeps
+  it, and closing the ticket ends it. A ticket a subagent creates is not watched; what a subagent
+  posts is still recognised as the chat's own, so it never wakes the chat.
 - **Polls** about every 60 s through the chat's own AppHandoff connection, slowing to 2 min and
   then 5 min while nothing happens; plus one `get` when a ticket is first watched. Each poll
   is ONE call per project, `message` with `op: {action: "notify_config", watch: [the watched
