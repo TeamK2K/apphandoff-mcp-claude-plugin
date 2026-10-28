@@ -1,16 +1,11 @@
 # AppHandoff for Claude Code
 
 AppHandoff is a ticket board your AI agents and your team share. This Claude Code plugin
-connects a chat to it, with two add-ons:
-
-- the **inbox**: when someone else posts on an AppHandoff ticket this chat claimed or
-  created, the chat gets a toast and is woken to read the thread and reply (or, when a
-  person posted, to ask you what to do through a board question). It also wakes the chat
-  when a person decides a milestone move this chat asked for, accepts or drops a milestone
-  this chat worked on, or answers a board question this chat asked;
-- the **Milestones pane**: one pane tab, a plain table of the milestones this chat's own
-  AppHandoff calls touched, plus every milestone approval waiting on you from any chat,
-  each with an "Approve in portal" link.
+connects a chat to it with the **inbox**: when someone else posts on an AppHandoff ticket
+this chat claimed or created, the chat gets a toast and is woken to read the thread and
+reply (or, when a person posted, to ask you what to do through a board question). It also
+wakes the chat when a person decides a milestone move this chat asked for, accepts or drops
+a milestone this chat worked on, or answers a board question this chat asked.
 
 Needs Claude Code 2.1.287 or later, your own Claude login, and the AppHandoff MCP
 connected in that chat.
@@ -33,8 +28,7 @@ Or from a terminal, in one go:
 claude plugin marketplace add https://apphandoff.com/claude/marketplace.json && claude plugin install apphandoff@apphandoff
 ```
 
-Start a new chat; `/inbox` shows what it watches, and the Milestones pane opens by
-itself in the desktop app.
+Start a new chat; `/inbox` shows what it watches.
 
 ## Connect
 
@@ -43,9 +37,11 @@ Claude Code yourself, pointing at `https://api.apphandoff.com/mcp`, and sign in 
 own AppHandoff account. The tools it serves are the ones Claude Code shows for that connection.
 
 The plugin learns which tickets and milestones to follow from the chat's own calls on that
-connection, then polls them with calls that change nothing on your board. It makes one
-call that does change your board: before it wakes the chat for a new message it **claims
-the ticket** for the chat, so two agents never work one ticket at once. That needs a
+connection, then polls them with calls that change nothing on your board. It makes two
+calls that do change your board: before it wakes the chat for a new message it **claims
+the ticket** for the chat, so two agents never work one ticket at once, and when the chat
+ends (you quit, `/clear` or resume another chat) it **releases** each ticket the chat still
+holds, so the next agent can pick it up at once (standby's claims are left to lapse). That needs a
 connection allowed to write; a read-only one is refused the claim once and then wakes as
 before. A person's message is never claimed for, so it always reaches the chat. The one
 exception is **standby**, which you turn on yourself: it claims for a person's message too.
@@ -61,12 +57,12 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   wake in flight, a 2-minute cooldown per ticket, 6 wakes an hour.
 - It claims a ticket for the chat (one `ticket` claim call, a write on your board) before waking
   it for a new message on that ticket (standby, which is off unless you turn it on, claims for a
-  person's message too and also makes `question` list reads); nothing else it sends changes your board.
-- The Milestones pane makes read-only `find` and `get` calls while it is open, refreshing
-  approvals every 60 s.
+  person's message too and also makes `question` list reads), and releases each ticket the chat
+  still holds when the chat ends (one `ticket` release call each); nothing else it sends changes
+  your board.
 - `/inbox` shows what the chat watches and lets you pause or resume wakes; `/inbox standby
   <project ids>` (off unless you run it) makes the chat a standing inbox for those projects.
-- It shows a status line, the Milestones pane and toasts, on your screen only.
+- It shows a status line and toasts, on your screen only.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
   pruned after 14 days) in Claude Code's own plugin store; it writes no other files.

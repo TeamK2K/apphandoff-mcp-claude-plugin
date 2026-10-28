@@ -1,5 +1,5 @@
 // AppHandoff for Claude Code — the plugin's hooks module: the inbox add-on
-// (HO-16353) and, composed in by `register`, the touched panes (HO-17539).
+// (HO-16353).
 //
 // Wakes this chat when someone else posts on a ticket it claimed or created,
 // when a person decides a milestone approval it asked for (HO-17707: read
@@ -8,26 +8,30 @@
 // (HO-19052: followed from its own plan calls, no proposal of its own). Watched
 // tickets are polled with one `message` notify_config watch call per project, then
 // one `get` per ticket it names as changed (HO-19546); a connection that cannot make
-// that call reads every ticket with `get`, as before. Before it wakes the chat for a new message it
-// claims the ticket for the chat (HO-19659: the plugin's one board write, under the chat's own
-// agent id; another agent's lease means no wake), and it wakes the chat when a person answers
+// that call reads every ticket with `get`, as before. A project that also waits on a
+// notice read asks for both in that one call (HO-21344). Before it wakes the chat for a new message it
+// claims the ticket for the chat (HO-19659: one of the plugin's two board writes, both under the chat's
+// own agent id; another agent's lease means no wake), and it wakes the chat when a person answers
 // a board question the chat asked. `/inbox standby <project ids>` (HO-19660) makes a chat a standing
 // inbox: it claims, one a poll, a message nobody answered six minutes after it was posted
 // and wakes the chat for it (a board question for a person's message, a reply-only wake for an outside
-// agent's). Every decision
+// agent's). When the chat ends it releases each ticket whose lease the chat still holds, and a
+// /clear or a resume starts the new chat's inbox under the new chat's own id (HO-21360). Every decision
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
 
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
+import { isTimeout, withCallTimeout } from './call-timeout'
 import * as core from './inbox-core'
 import { statusWith } from './status-line'
-import { registerPanes } from './touched'
 
 let state: core.InboxState | null = null
 let timer: { cancel: () => void } | null = null
 let polling = false
 let off = false
+/** A new chat's id (after a /clear or a resume) whose inbox is built once the running poll ends (HO-21360). */
+let startAfterTick: string | null = null
 /** Arguments of the chat's own AppHandoff calls still awaiting their result, by tool_use id. */
 const pendingCalls = new Map<string, core.PendingCall>()
 
@@ -35,6 +39,12 @@ const textOf = (r: McpToolResult) =>
   r.content.map((c) => ('text' in c && typeof c.text === 'string' ? c.text : '')).join('\n')
 
 type Answer = { ok: true; json: unknown } | { ok: false; text: string }
+
+/** A board call held to the 60 s limit (HO-21343); the engine's timer is spelled `$.clock.after` here, never passed as `$.clock`. */
+const bounded = <T>($: EngineInterface, call: Promise<T>) => withCallTimeout((ms, fn) => $.clock.after(ms, fn), call)
+
+/** Whether a failed poll ends this tick: a sign-in stop, a rate-limit wait, or a call that timed out (a dead link; the next tick tries again). */
+const endsTick = (s: core.InboxState, text: string) => s.authStopped || s.retryAt !== null || isTimeout(text)
 
 /** The first content block's text: where a `get` answer carries its JSON when there is no structuredContent. */
 const firstTextOf = (r: McpToolResult) => {
@@ -46,10 +56,33 @@ const firstTextOf = (r: McpToolResult) => {
 async function readThread($: EngineInterface, server: string, args: Record<string, unknown>): Promise<Answer> {
   if (state) state = { ...state, calls: state.calls + 1 }
   try {
-    const r = await $.mcp.call(server, 'get', args)
+    const r = await bounded($, $.mcp.call(server, 'get', args))
     if (r.isError) return { ok: false, text: textOf(r) || 'get failed' }
     const card = core.ticketFromCard(core.v3Json(r.structuredContent, firstTextOf(r)))
     return card ? { ok: true, json: card } : { ok: false, text: 'get returned no ticket card' }
+  } catch (err) {
+    return { ok: false, text: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+type Tool = 'message' | 'ticket' | 'question'
+
+/**
+ * One board call: its JSON answer when `answers` takes it, else the failure text. A refusal
+ * answered as a plain result is a failure too. Never throws.
+ */
+async function boardCall(
+  $: EngineInterface,
+  server: string,
+  tool: Tool,
+  args: Record<string, unknown>,
+  answers: (json: unknown) => boolean,
+): Promise<Answer> {
+  try {
+    const r = await bounded($, $.mcp.call(server, tool, args))
+    const json = core.v3Json(r.structuredContent, firstTextOf(r)) ?? core.parseJson(textOf(r))
+    if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !answers(json))) return { ok: true, json }
+    return { ok: false, text: textOf(r) || JSON.stringify(json ?? 'message failed') }
   } catch (err) {
     return { ok: false, text: err instanceof Error ? err.message : String(err) }
   }
@@ -60,30 +93,22 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
  * the watch list (HO-19546), or (`tool` ticket) the claim before a wake (HO-19659), or (`tool` question)
  * the standing inbox's open-question check (HO-19660).
  * `answers` says whether a JSON body is the answer asked for. A GUIDANCE_STALE
- * refusal hands back the current revision: one retry with it. A refusal answered
- * as a plain result is a failure too.
+ * refusal hands back the current revision: one retry with it.
  */
 async function callNotify(
   $: EngineInterface,
   server: string,
   argsOf: (s: core.InboxState) => Record<string, unknown>,
   answers: (json: unknown) => boolean,
-  tool: 'message' | 'ticket' | 'question' = 'message',
+  tool: Tool = 'message',
 ): Promise<Answer> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!state) return { ok: false, text: 'inbox stopped' }
     state = { ...state, calls: state.calls + 1 }
-    let text: string
-    try {
-      const r = await $.mcp.call(server, tool, argsOf(state))
-      const json = core.v3Json(r.structuredContent, firstTextOf(r)) ?? core.parseJson(textOf(r))
-      if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !answers(json))) return { ok: true, json }
-      text = textOf(r) || JSON.stringify(json ?? 'message failed')
-    } catch (err) {
-      return { ok: false, text: err instanceof Error ? err.message : String(err) }
-    }
-    const rev = core.staleGuidanceRev(text)
-    if (!rev || attempt > 0) return { ok: false, text }
+    const r = await boardCall($, server, tool, argsOf(state), answers)
+    if (r.ok) return r
+    const rev = core.staleGuidanceRev(r.text)
+    if (!rev || attempt > 0) return r
     if (state) state = { ...state, guidanceRev: rev }
   }
   return { ok: false, text: 'the rule-table revision kept changing' }
@@ -93,12 +118,14 @@ async function callNotify(
  * One project's notices, newest first, walked back with next_before while a
  * page overflowed; the cursor moves to the newest notice once the walk ends.
  * A walk the page cap cuts off resumes from where it stopped on the next tick.
+ * `first` is the first page when this tick's watch call already carried it (HO-21344).
  */
 async function readNotices(
   $: EngineInterface,
   server: string,
   req: core.NoticeRequest,
   now: number,
+  first?: core.NoticeFirst,
 ): Promise<
   | { ok: true; decided: core.ApprovalWait[]; settled: core.DrivenMilestone[]; answered: core.QuestionWait[]; standbyStopped: boolean }
   | { ok: false; text: string }
@@ -113,10 +140,14 @@ async function readNotices(
   let finished = false
   for (let page = 0; page < core.NOTICE_PAGES; page++) {
     const asked = before ? { ...req, before } : req
-    const r = await callNotify($, server, (s) => core.noticeArgs(asked, s), (j) => core.noticesIn(j) !== null)
-    if (!r.ok) return r
-    const list = core.noticesIn(r.json)
-    if (!list) return { ok: false, text: 'notify_config returned no notice list' }
+    // The first page came with the watch call, unless what it asked for is no longer what this page asks.
+    let list = page === 0 && first && core.sameNoticeAsk(first.ask, asked) ? first.page : null
+    if (!list) {
+      const r = await callNotify($, server, (s) => core.noticeArgs(asked, s), (j) => core.noticesIn(j) !== null)
+      if (!r.ok) return r
+      list = core.noticesIn(r.json)
+      if (!list) return { ok: false, text: 'notify_config returned no notice list' }
+    }
     if (!state) return { ok: false, text: 'inbox stopped' }
     newest ??= core.newestNotice(list)
     const applied = core.applyNotices(state, list, now, req.projectId)
@@ -157,10 +188,10 @@ async function claimBeforeWake($: EngineInterface, server: string, w: core.Watch
   return outcome
 }
 
-async function save($: EngineInterface) {
-  if (!state) return
+async function save($: EngineInterface, s: core.InboxState | null = state) {
+  if (!s) return
   try {
-    await $.store.set(core.STORE_PREFIX + state.sessionId, core.toStored(state, await $.clock.now()))
+    await $.store.set(core.STORE_PREFIX + s.sessionId, core.toStored(s, await $.clock.now()))
   } catch {}
 }
 
@@ -202,12 +233,23 @@ async function failed($: EngineInterface, text: string, now: number) {
   else if (r.firstError) $.ui.toast(`AppHandoff inbox: poll failed — ${state.lastError}`)
 }
 
-type Polled = { fresh: core.Fresh[]; failures: number; stop: boolean }
+/** `notices`: the first notice pages the watch calls carried this tick, for the notice loop to apply (HO-21344). */
+type Polled = { fresh: core.Fresh[]; failures: number; stop: boolean; notices: core.NoticeFirst[] }
+
+/** A poll call that failed for now (not a refusal for good): counted, and it ends the tick when the failure says so. */
+async function pollCallFailed($: EngineInterface, text: string, now: number, out: Polled): Promise<boolean> {
+  out.failures++
+  await failed($, text, now)
+  out.stop = !state || endsTick(state, text)
+  return out.stop
+}
 
 /**
  * The reads this tick owes. The watch list names the changed tickets, so a quiet
  * board costs one call. A refusal for good (read-only scope, an older server) or an
  * answer without the list ends the list for this connection: every ticket is read.
+ * A project that also owes a notice page asks for both in that one call (HO-21344); a
+ * combined call the board refuses, or answers in part, is asked as two calls from then on.
  */
 async function planReads($: EngineInterface, server: string, now: number, out: Polled): Promise<core.TicketRead[]> {
   if (!state) return []
@@ -215,18 +257,33 @@ async function planReads($: EngineInterface, server: string, now: number, out: P
   if (state.watchReadOff) return plain('all')
   const reads = plain('unprojected')
   for (const req of core.watchPlan(state)) {
-    const r = await callNotify($, server, (s) => core.watchArgs(req, s), (j) => core.watchIn(j) !== null)
-    if (!state) return []
-    if (!r.ok && !core.watchRefused(r.text)) {
-      out.failures++
-      await failed($, r.text, now)
-      if (!state || state.authStopped || state.retryAt !== null) {
-        out.stop = true
+    let answer: core.WatchAnswer | null = null
+    const notice = core.combinedNotice(state, req)
+    if (notice) {
+      const c = await callNotify($, server, (s) => core.combinedArgs(req, notice, s), (j) => core.combinedIn(j) !== null)
+      if (!state) return []
+      const both = c.ok ? core.combinedIn(c.json) : null
+      if (both) {
+        answer = both.watch
+        out.notices.push({ ask: notice, page: both.notices })
+      } else if (c.ok || core.combinedRefused(c.text)) {
+        // A part missing, or a board that cannot take the two keys together: separate calls from now on.
+        state = core.stopCombinedReads(state)
+      } else if (!core.isLastingRefusal(c.text) && (await pollCallFailed($, c.text, now, out))) {
         return []
       }
-      continue
+      // Any other failure that does not end the tick (a passing fault, or a refusal that says nothing about
+      // combining) leaves combining on: this tick asks the watch and the notice read on their own.
     }
-    const answer = r.ok ? core.watchIn(r.json) : null
+    if (!answer) {
+      const r = await callNotify($, server, (s) => core.watchArgs(req, s), (j) => core.watchIn(j) !== null)
+      if (!state) return []
+      if (!r.ok && !core.watchRefused(r.text)) {
+        if (await pollCallFailed($, r.text, now, out)) return []
+        continue
+      }
+      answer = r.ok ? core.watchIn(r.json) : null
+    }
     if (!answer) {
       state = core.stopWatchReads(state)
       return plain('all')
@@ -259,7 +316,7 @@ async function readTickets($: EngineInterface, server: string, reads: core.Ticke
     if (!r.ok) {
       out.failures++
       await failed($, r.text, now)
-      if (!state || state.authStopped || state.retryAt !== null) {
+      if (!state || endsTick(state, r.text)) {
         out.stop = true
         return
       }
@@ -278,6 +335,8 @@ async function readTickets($: EngineInterface, server: string, reads: core.Ticke
 
 /** Submit a wake prompt; once it enters (or never does) settle (or abort) what it named. Fire and forget. */
 function submitWake($: EngineInterface, text: string, decidedAt: number) {
+  // Settled for the chat that sent it: after a /clear or a resume (HO-21360) it is not the new chat's.
+  const sessionId = state?.sessionId
   $.prompt
     .submit({ text })
     .then(
@@ -285,7 +344,7 @@ function submitWake($: EngineInterface, text: string, decidedAt: number) {
       () => false,
     )
     .then(async (entered) => {
-      if (!state) return
+      if (!state || state.sessionId !== sessionId) return
       state = entered ? core.settleWake(state, decidedAt) : core.abortWake(state)
       if (!entered) $.ui.toast('AppHandoff inbox: the wake did not reach the chat — will retry')
       show($)
@@ -365,8 +424,9 @@ async function tick($: EngineInterface) {
       }
       if (!r.ok || core.ticketPayloads(r.json).length === 0) {
         failures++
-        await failed($, r.ok ? `${w.ref}: no ticket returned` : r.text, now)
-        if (!state || state.authStopped || state.retryAt !== null) return
+        const text = r.ok ? `${w.ref}: no ticket returned` : r.text
+        await failed($, text, now)
+        if (!state || endsTick(state, text)) return
         break
       }
       state = core.applyBaseline(state, w.ref, r.json)
@@ -374,7 +434,7 @@ async function tick($: EngineInterface) {
 
     // One watch call per project names the changed tickets; each is read with one `get`
     // (all of them, one `get` apiece, when the board answers no watch list).
-    const polled: Polled = { fresh: [], failures: 0, stop: false }
+    const polled: Polled = { fresh: [], failures: 0, stop: false, notices: [] }
     await readTickets($, server, await planReads($, server, now, polled), now, polled)
     if (polled.stop || !state) return
     const fresh = polled.fresh
@@ -384,7 +444,7 @@ async function tick($: EngineInterface) {
     const settled: core.DrivenMilestone[] = []
     const answered: core.QuestionWait[] = []
     for (const req of core.noticePlan(state)) {
-      const r = await readNotices($, server, req, now)
+      const r = await readNotices($, server, req, now, polled.notices.find((f) => f.ask.projectId === req.projectId))
       if (!state) return
       if (r.ok) {
         decided.push(...r.decided)
@@ -401,7 +461,7 @@ async function tick($: EngineInterface) {
       }
       failures++
       await failed($, r.text, now)
-      if (!state || state.authStopped || state.retryAt !== null) return
+      if (!state || endsTick(state, r.text)) return
     }
     if (failures === 0) state = core.pollOk(state, now)
 
@@ -420,6 +480,7 @@ async function tick($: EngineInterface) {
     const hold: string[] = []
     if (!state) return
     let claimsStopped = false
+    let linkDead = false
     for (const w of core.claimTargets(state, await $.clock.now())) {
       const claimAt = await $.clock.now()
       // A sign-in failure or rate limit ends this tick's claims; the rest wait for the next tick.
@@ -431,7 +492,8 @@ async function tick($: EngineInterface) {
       if (!state) return
       if (outcome.kind === 'retry') {
         if (core.claimHoldsWake(w, claimAt)) hold.push(core.labelOf(w))
-        claimsStopped = state.authStopped || state.retryAt !== null
+        claimsStopped = endsTick(state, outcome.text)
+        linkDead ||= isTimeout(outcome.text)
         continue
       }
       const applied = core.applyClaim(state, w.ref, outcome, claimAt)
@@ -449,7 +511,8 @@ async function tick($: EngineInterface) {
       submitWake($, core.wakePrompt(d.wake, d.approvals, state.sessionId, d.driven, d.questions), decidedAt)
     }
     // The standing inbox (HO-19660) acts only when nothing else is waking the chat this tick.
-    await standbyStep($, server)
+    // A call that timed out ends the tick's board calls: the standing inbox's turn waits for the next tick.
+    if (!linkDead) await standbyStep($, server)
   } catch (err) {
     if (state) state = { ...state, lastError: err instanceof Error ? err.message : String(err) }
   } finally {
@@ -458,19 +521,58 @@ async function tick($: EngineInterface) {
       show($)
       await save($)
       if (state) schedule($, core.pollIntervalMs(state, now || (await $.clock.now())))
+      if (startAfterTick) {
+        const sessionId = startAfterTick
+        startAfterTick = null
+        await start($, sessionId)
+      }
     } catch {}
   }
 }
 
+/** This chat's inbox, from what the store kept under its id, and its first poll; stale keys are pruned. */
+async function start($: EngineInterface, sessionId: string) {
+  off = core.isOff(await $.env.get('APPHANDOFF_INBOX'))
+  const now = await $.clock.now()
+  const own = await $.store.get(core.STORE_PREFIX + sessionId)
+  pendingCalls.clear()
+  state = core.fromStored(sessionId, core.expired(own, now) ? undefined : own, now)
+  if (off) return
+  for (const key of await $.store.keys()) {
+    if (key.startsWith(core.STORE_PREFIX) && key !== core.STORE_PREFIX + sessionId) {
+      if (core.expired(await $.store.get(key), now)) await $.store.delete(key)
+    }
+  }
+  show($)
+  schedule($, 1_000)
+}
+
 /**
- * The plugin's one hooks module (hooks.json names one per plugin): the touched
- * panes (./touched.tsx) register their hooks, then the inbox below. Neither
- * reads the other's state; they share only the status line (./status-line.ts)
- * and which server is AppHandoff (./apphandoff-server.ts).
+ * The chat is ending (HO-21360): release each ticket whose lease it still holds, all at once (the
+ * engine gives every end hook 1.5 s together), so the next agent is not refused the ticket for the rest
+ * of the 20 minutes and the claim does not wait for the board's two-day sweep. A release that fails or
+ * is cut off leaves that lease to lapse on its own, as before. Works on the ended chat's own state,
+ * never the module's, which is already stopped; answers that state with the released leases cleared.
+ */
+async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise<core.InboxState> {
+  const server = core.activeServer(ending)
+  if (!server) return ending
+  const release = async (w: core.Watched) => {
+    const r = await boardCall($, server, 'ticket', core.releaseArgs(w, ending), () => false)
+    const rev = r.ok ? null : core.staleGuidanceRev(r.text)
+    return rev ? (await boardCall($, server, 'ticket', core.releaseArgs(w, { ...ending, guidanceRev: rev }), () => false)).ok : r.ok
+  }
+  const held = core.heldLeases(ending, await $.clock.now())
+  const released = await Promise.all(held.map(release))
+  return held.reduce((s, w, i) => (released[i] ? core.holdLease(s, w.ref, null) : s), ending)
+}
+
+/**
+ * The plugin's one hooks module (hooks.json names one per plugin): the inbox.
+ * It draws the status line through ./status-line.ts and decides which server
+ * is AppHandoff in ./apphandoff-server.ts.
  */
 export const register: Register = (on) => {
-  registerPanes(on)
-
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     try {
@@ -481,19 +583,43 @@ export const register: Register = (on) => {
       })
     } catch {}
     try {
-      off = core.isOff(await $.env.get('APPHANDOFF_INBOX'))
-      const sessionId = await $.session.id()
-      const now = await $.clock.now()
-      const own = await $.store.get(core.STORE_PREFIX + sessionId)
-      state = core.fromStored(sessionId, core.expired(own, now) ? undefined : own, now)
-      if (off) return result
-      for (const key of await $.store.keys()) {
-        if (key.startsWith(core.STORE_PREFIX) && key !== core.STORE_PREFIX + sessionId) {
-          if (core.expired(await $.store.get(key), now)) await $.store.delete(key)
-        }
+      await start($, await $.session.id())
+    } catch {}
+    return result
+  })
+
+  // The chat ends: on exit, and on a /clear or a resume, after which the process goes on under a new
+  // chat id with no `session.start` (HO-21360). Its inbox stops before the first wait, so a poll still
+  // running claims and wakes nothing more; then its leases are released and its state saved, before
+  // the engine's end step. An end that names another chat touches nothing of this one's.
+  on('session.end', async ($, e, next) => {
+    if (startAfterTick === e.sessionId) startAfterTick = null
+    const ending = state?.sessionId === e.sessionId ? state : null
+    if (ending) {
+      timer?.cancel()
+      timer = null
+      state = null
+    }
+    try {
+      if (ending && !off) {
+        await save($, ending)
+        const released = await releaseHeld($, ending)
+        if (released !== ending) await save($, released)
       }
-      show($)
-      schedule($, 1_000)
+    } catch {}
+    return next(e)
+  })
+
+  // A /clear or a resume names the new chat here: its inbox starts from what the store kept under its id,
+  // once a poll still running for the ended chat has finished. The newest chat wins over a start still waiting.
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      const sessionId = e.session_id || (await $.session.id())
+      if (sessionId && sessionId !== state?.sessionId && (e.source === 'clear' || e.source === 'resume')) {
+        startAfterTick = polling ? sessionId : null
+        if (!polling) await start($, sessionId)
+      }
     } catch {}
     return result
   })
