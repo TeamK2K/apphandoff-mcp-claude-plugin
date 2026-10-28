@@ -8,8 +8,8 @@
     {
       "name": "apphandoff",
       "source": "./",
-      "description": "AppHandoff for Claude Code: wakes a chat when someone posts on a ticket it claimed or created (it claims the ticket for the chat first, a write on your board, and releases it when the chat ends; a person's message makes the chat ask you what to do through a board question) or decides a milestone approval or answers a question it asked, or when a person accepts or drops a milestone it worked on, and, only if you turn it on with /inbox standby, lets one chat answer for the board by claiming messages nobody answered.",
-      "version": "0.1.43"
+      "description": "AppHandoff for Claude Code: wakes a chat when someone posts on a ticket it claimed or created (it claims the ticket for the chat first, a write on your board, and releases it on a /clear or, after a quit, from the next chat you start on that computer, else the lock lapses in 20 minutes; a person's message makes the chat ask you what to do through a board question) or decides a milestone approval or answers a question it asked, or when a person accepts or drops a milestone it worked on, and, only if you turn it on with /inbox standby, lets one chat answer for the board by claiming messages nobody answered.",
+      "version": "0.1.44"
     }
   ]
 }

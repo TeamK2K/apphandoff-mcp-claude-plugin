@@ -2665,10 +2665,32 @@ export function parseCommand(args: string): InboxCommand {
 export type Stored = Pick<
   InboxState,
   'servers' | 'watched' | 'ownIds' | 'wakeTimes' | 'paused' | 'approvals' | 'driven' | 'questions' | 'noticeCursors' | 'approvalsOff' | 'guidanceRev' | 'standby'
-> & { savedAt: number }
+> & {
+  savedAt: number
+  /** When the chat ended (HO-21402): another chat's sweep releases the leases of a marked entry. A resume drops it. */
+  endedAt?: number
+}
 
-export function toStored(state: InboxState, now: number): Stored {
+/** The ended mark a stored entry carries (HO-21402), or null. */
+export const endedAtOf = (raw: unknown): number | null => (isRecord(raw) && typeof raw.endedAt === 'number' ? raw.endedAt : null)
+
+/**
+ * The ended chats a sweep releases for (HO-21402), from store `[key, raw]` pairs: each entry other than
+ * `ownKey` that carries the ended mark, is not expired, names exactly one server, and holds a live lease, as
+ * the state it would release from (its id from the key). `endedAt` is the entry's mark.
+ */
+export function endedToRelease(entries: [string, unknown][], ownKey: string, now: number): { state: InboxState; endedAt: number }[] {
+  return entries.flatMap(([key, raw]) => {
+    const endedAt = endedAtOf(raw)
+    if (endedAt === null || key === ownKey || !key.startsWith(STORE_PREFIX) || expired(raw, now)) return []
+    const state = fromStored(key.slice(STORE_PREFIX.length), raw, now)
+    return activeServer(state) !== null && heldLeases(state, now).length > 0 ? [{ state, endedAt }] : []
+  })
+}
+
+export function toStored(state: InboxState, now: number, endedAt?: number): Stored {
   return {
+    ...(endedAt !== undefined && { endedAt }),
     servers: state.servers,
     watched: state.watched,
     ownIds: state.ownIds,

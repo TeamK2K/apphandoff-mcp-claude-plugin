@@ -15,7 +15,9 @@
 // a board question the chat asked. `/inbox standby <project ids>` (HO-19660) makes a chat a standing
 // inbox: it claims, one a poll, a message nobody answered six minutes after it was posted
 // and wakes the chat for it (a board question for a person's message, a reply-only wake for an outside
-// agent's). When the chat ends it releases each ticket whose lease the chat still holds, and a
+// agent's). When the chat ends it tries to release each ticket whose lease the chat still holds: that lands on an
+// in-process /clear; after a quit, a closed window or a desktop clear the engine refuses board calls at the end, so the
+// next chat started on that computer releases them (HO-21402), and otherwise the lease lapses in 20 minutes. A
 // /clear or a resume starts the new chat's inbox under the new chat's own id (HO-21360). Every decision
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
@@ -28,6 +30,8 @@ import { statusWith } from './status-line'
 
 let state: core.InboxState | null = null
 let timer: { cancel: () => void } | null = null
+/** The pending sweep of ended chats' leases (HO-21402): its own timer, since `schedule` refuses a chat that watches nothing. */
+let sweepTimer: { cancel: () => void } | null = null
 let polling = false
 let off = false
 /** A new chat's id (after a /clear or a resume) whose inbox is built once the running poll ends (HO-21360). */
@@ -188,10 +192,10 @@ async function claimBeforeWake($: EngineInterface, server: string, w: core.Watch
   return outcome
 }
 
-async function save($: EngineInterface, s: core.InboxState | null = state) {
+async function save($: EngineInterface, s: core.InboxState | null = state, endedAt?: number) {
   if (!s) return
   try {
-    await $.store.set(core.STORE_PREFIX + s.sessionId, core.toStored(s, await $.clock.now()))
+    await $.store.set(core.STORE_PREFIX + s.sessionId, core.toStored(s, await $.clock.now(), endedAt))
   } catch {}
 }
 
@@ -537,6 +541,11 @@ async function start($: EngineInterface, sessionId: string) {
   const own = await $.store.get(core.STORE_PREFIX + sessionId)
   pendingCalls.clear()
   state = core.fromStored(sessionId, core.expired(own, now) ? undefined : own, now)
+  const startNo = ++sweepStart
+  sweepTimer?.cancel()
+  sweepTimer = null
+  // A chat that starts again under an ended id (a resume) drops the mark at once, so no other chat's sweep releases its leases.
+  if (!core.expired(own, now) && core.endedAtOf(own) !== null) await save($)
   if (off) return
   for (const key of await $.store.keys()) {
     if (key.startsWith(core.STORE_PREFIX) && key !== core.STORE_PREFIX + sessionId) {
@@ -545,14 +554,64 @@ async function start($: EngineInterface, sessionId: string) {
   }
   show($)
   schedule($, 1_000)
+  armSweep($, sessionId, 1, SWEEP_FIRST_MS, startNo)
+}
+
+const SWEEP_FIRST_MS = 5_000
+const SWEEP_RETRY_MS = 30_000
+const SWEEP_ATTEMPTS = 4
+
+/** Counts the starts: a sweep from an earlier start arms nothing more once a newer one has begun. */
+let sweepStart = 0
+
+function armSweep($: EngineInterface, sessionId: string, attempt: number, ms: number, startNo: number) {
+  sweepTimer?.cancel()
+  sweepTimer = $.clock.after(ms, () => void sweepEnded($, sessionId, attempt, startNo))
 }
 
 /**
- * The chat is ending (HO-21360): release each ticket whose lease it still holds, all at once (the
- * engine gives every end hook 1.5 s together), so the next agent is not refused the ticket for the rest
- * of the 20 minutes and the claim does not wait for the board's two-day sweep. A release that fails or
- * is cut off leaves that lease to lapse on its own, as before. Works on the ended chat's own state,
- * never the module's, which is already stopped; answers that state with the released leases cleared.
+ * Release the leases of chats that ended (HO-21402): a chat's process ending leaves its `session.end` release refused
+ * (no session is bound), so this chat, started later on the same computer, sends it under the ended chat's agent id
+ * (`cc:<id>`: the claim belongs to the connection, not to the chat). One attempt: every other entry marked ended
+ * that holds a live lease on one server is released with releaseHeld and written back with the mark kept (unless a
+ * resume cleared it meanwhile). When releases were sent and none landed (the session not bound yet), the next attempt
+ * is 30 s later, at most 4 in all. Never throws.
+ */
+async function sweepEnded($: EngineInterface, sessionId: string, attempt: number, startNo: number) {
+  if (startNo === sweepStart) sweepTimer = null
+  if (off) return
+  try {
+    const now = await $.clock.now()
+    const entries: [string, unknown][] = []
+    for (const key of await $.store.keys()) {
+      if (key.startsWith(core.STORE_PREFIX) && key !== core.STORE_PREFIX + sessionId) entries.push([key, await $.store.get(key)])
+    }
+    let sent = 0
+    let landed = 0
+    for (const { state: ended } of core.endedToRelease(entries, core.STORE_PREFIX + sessionId, now)) {
+      const released = await releaseHeld($, ended)
+      sent += core.heldLeases(ended, now).length
+      landed += core.heldLeases(ended, now).length - core.heldLeases(released, now).length
+      if (released === ended) continue
+      // A resume may have cleared the mark while the releases were out: then the entry is a live chat's, left as it is.
+      const key = core.STORE_PREFIX + ended.sessionId
+      const endedAt = core.endedAtOf(await $.store.get(key))
+      if (endedAt !== null) await save($, released, endedAt)
+    }
+    if (sent > 0 && landed === 0 && attempt < SWEEP_ATTEMPTS && startNo === sweepStart && !off) {
+      armSweep($, sessionId, attempt + 1, SWEEP_RETRY_MS, startNo)
+    }
+  } catch {}
+}
+
+/**
+ * Release each ticket whose lease a chat still holds, all at once, so the next agent is not refused the ticket
+ * for the rest of the 20 minutes (HO-21360). It lands at the end only on an in-process /clear; when the process
+ * ends (a quit, a closed window, a desktop clear) the engine refuses every board call there ("no session is
+ * bound in this process"), and the next chat started on that computer releases it instead, from its sweep
+ * (HO-21402); otherwise the lease lapses in 20 minutes. A release that fails or is cut off leaves that lease to
+ * lapse on its own. Works on the given chat's state, never the module's; answers that state with the released
+ * leases cleared.
  */
 async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise<core.InboxState> {
   const server = core.activeServer(ending)
@@ -602,9 +661,11 @@ export const register: Register = (on) => {
     }
     try {
       if (ending && !off) {
-        await save($, ending)
+        // Marked ended first (HO-21402): when the process is ending the release below is refused, and the next chat's sweep reads this mark.
+        const endedAt = await $.clock.now()
+        await save($, ending, endedAt)
         const released = await releaseHeld($, ending)
-        if (released !== ending) await save($, released)
+        if (released !== ending) await save($, released, endedAt)
       }
     } catch {}
     return next(e)

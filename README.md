@@ -39,9 +39,11 @@ own AppHandoff account. The tools it serves are the ones Claude Code shows for t
 The plugin learns which tickets and milestones to follow from the chat's own calls on that
 connection, then polls them with calls that change nothing on your board. It makes two
 calls that do change your board: before it wakes the chat for a new message it **claims
-the ticket** for the chat, so two agents never work one ticket at once, and when the chat
-ends (you quit, `/clear` or resume another chat) it **releases** each ticket the chat still
-holds, so the next agent can pick it up at once (standby's claims are left to lapse). That needs a
+the ticket** for the chat, so two agents never work one ticket at once, and it **releases**
+each ticket the chat still holds so the next agent can pick it up at once: when the chat ends
+on a `/clear`, and, after you quit or close the window or clear in the desktop app, when the
+next chat you start on that computer runs (within seconds of starting). Otherwise the lease
+lapses in 20 minutes (standby's claims are always left to lapse). That needs a
 connection allowed to write; a read-only one is refused the claim once and then wakes as
 before. A person's message is never claimed for, so it always reaches the chat. The one
 exception is **standby**, which you turn on yourself: it claims for a person's message too.
@@ -58,8 +60,10 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
 - It claims a ticket for the chat (one `ticket` claim call, a write on your board) before waking
   it for a new message on that ticket (standby, which is off unless you turn it on, claims for a
   person's message too and also makes `question` list reads), and releases each ticket the chat
-  still holds when the chat ends (one `ticket` release call each); nothing else it sends changes
-  your board.
+  still holds (one `ticket` release call each): when the chat ends on a `/clear`, or, after a
+  quit, a closed window or a desktop clear, when the next chat started on that computer runs
+  (otherwise the lease lapses in 20 minutes); nothing else it sends changes your board. To make
+  that possible it marks a chat's saved state with the time the chat ended.
 - `/inbox` shows what the chat watches and lets you pause or resume wakes; `/inbox standby
   <project ids>` (off unless you run it) makes the chat a standing inbox for those projects.
 - It shows a status line and toasts, on your screen only.
