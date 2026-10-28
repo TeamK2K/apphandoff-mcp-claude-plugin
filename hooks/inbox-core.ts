@@ -432,14 +432,15 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
   if (name.tool !== 'ticket' || call.args.dry_run === true) return { state: next, changed, authResumed, evicted }
   const project = projectHint(call.args, json)
   // `ticket { ops }` (HO-21342): each op whose result is ok teaches what the same single op would.
-  // A refused or not-run op teaches nothing; the batch answer carries no card and no lease time.
+  // A refused or not-run op teaches nothing; the batch answer carries no card and no lease time, so a
+  // lease a landed op took is held the board's lease length from now (HO-21379), for the release at the end.
   const batch = batchedOps(call.args, json)
   if (batch) {
     for (const { op, entry } of batch) {
       const ref = normalizeRef(op.ref) ?? normalizeRef(entry.ref)
       // A batched create names its ticket only in its result entry, in the HO-n-slug form.
       const made = op.action === 'create' && typeof entry.ref === 'string' && /^HO-\d/i.test(entry.ref.trim()) ? [normalizeRef(entry.ref)] : []
-      const r = applyTicketOp(next, op, ref, entry, made.filter((m): m is string => m !== null), project, scope, now)
+      const r = applyTicketOp(next, op, ref, entry, made.filter((m): m is string => m !== null), project, scope, now, now + BOARD_LEASE_MS)
       next = r.state
       changed = changed || r.changed
       evicted.push(...r.evicted)
@@ -447,7 +448,7 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
     return { state: next, changed, authResumed, evicted }
   }
   const op = isRecord(call.args.op) ? call.args.op : {}
-  const r = applyTicketOp(next, op, normalizeRef(call.args.ref), json, createdTickets(json), project, scope, now)
+  const r = applyTicketOp(next, op, normalizeRef(call.args.ref), json, createdTickets(json), project, scope, now, null)
   return { state: r.state, changed: changed || r.changed, authResumed, evicted: [...evicted, ...r.evicted] }
 }
 
@@ -477,7 +478,8 @@ export function batchedOps(
  * What one landed ticket op teaches the watched set: a claim watches and holds its lease, a create
  * watches what it created, a release or close ends the watch, a move into or out of in_progress takes
  * or ends the lease. `answer` is the single answer or the batch's result entry (lease and stage are read
- * from it, else from the op).
+ * from it, else from the op). `leaseFallback` is when a lease the op took lapses if `answer` names no
+ * expiry: null for a single answer (no lease named = none taken: a human-run connection leases nothing).
  */
 function applyTicketOp(
   state: InboxState,
@@ -488,17 +490,18 @@ function applyTicketOp(
   project: string | null,
   scope: RowScope,
   now: number,
+  leaseFallback: number | null,
 ): { state: InboxState; changed: boolean; evicted: string[] } {
   let next = state
   let changed = false
   const evicted: string[] = []
+  const leaseUntil = leaseUntilIn(answer) ?? leaseFallback
   // A move out of in_progress releases the lease (releasesLease); a move into it takes one (HO-19659).
   if (op.action === 'move' && ref) {
     const card = isRecord(answer) && isRecord(answer.card) ? answer.card : null
     const stage = typeof card?.stage === 'string' ? card.stage : typeof op.stage === 'string' ? op.stage : null
     if (stage === 'in_progress') {
-      const until = leaseUntilIn(answer)
-      if (until !== null) next = holdLease(next, ref, until)
+      if (leaseUntil !== null) next = holdLease(next, ref, leaseUntil)
     } else if (stage) {
       next = holdLease(next, ref, null)
     }
@@ -507,7 +510,7 @@ function applyTicketOp(
     // A builder's claim starts the chat's watch too (HO-19657): the chat spawned it and waits on its ticket.
     const r = watch(next, ref, project, now)
     // ... and its lease is the chat's own: a wake needs no claim of the plugin's while it runs (HO-19659).
-    next = holdLease(r.state, ref, leaseUntilIn(answer))
+    next = holdLease(r.state, ref, leaseUntil)
     evicted.push(...r.evicted)
     changed = true
   } else if (scope === 'subagent' && op.action !== 'close') {
@@ -576,6 +579,8 @@ export const CLAIM_NOTE = 'AppHandoff plugin: claimed for the chat that watches 
 export const CLAIM_MARGIN_MS = 60_000
 /** Held with no expiry in the answer (a human-run connection leases nothing): trusted this long. */
 export const CLAIM_FALLBACK_MS = 5 * 60_000
+/** The board's lease length: a claim, or a move into in_progress, leases the ticket this long. */
+export const BOARD_LEASE_MS = 20 * 60_000
 
 /** When the lease a claim answer names lapses (`lease.lease_expires_at`), or null. */
 export function leaseUntilIn(json: unknown): number | null {
