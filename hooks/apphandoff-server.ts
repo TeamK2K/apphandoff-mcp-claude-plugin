@@ -1,6 +1,6 @@
-// Which MCP server is AppHandoff (HO-17543). The ONE recognition both add-ons
-// use — the inbox (inbox-core.ts) and the touched panes (touched-core.ts) — so
-// they never disagree about whose call a transcript row is. Pure: no `$`, no I/O.
+// Which MCP server is AppHandoff (HO-17543). The ONE recognition the inbox
+// (inbox-core.ts) uses, so it never disagrees with itself about whose call a
+// transcript row is. Pure: no `$`, no I/O.
 //
 // A tool arrives as `mcp__<server>__<tool>`. The host names the server one of
 // two ways: after the connector (`mcp__apphandoff__get`), or by an id (the

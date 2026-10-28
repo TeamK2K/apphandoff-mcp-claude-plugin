@@ -22,13 +22,12 @@ export const WAKE_LINES = 10
 export const OWN_WRITE_SETTLE_MS = 2_000
 
 // Which server is AppHandoff (the ten tool names, a server named like it, an
-// id-named server's answer) is decided once, in ./apphandoff-server.ts, for
-// the inbox and the touched panes alike.
+// id-named server's answer) is decided once, in ./apphandoff-server.ts.
 import { isAppHandoffCall, isAppHandoffTool, mayBeAppHandoff, parseToolName } from './apphandoff-server'
-// The panes' pure parsers of a human gate and a decision (HO-17707): reused,
-// never their state. Called only inside functions — the two cores import each other.
-import { approvalIn, decisionIn, isAwaitingApproval } from './touched-core'
+import { isTimeout } from './call-timeout'
 export { DETECTOR_TOOLS, isAppHandoffTool, parseToolName } from './apphandoff-server'
+
+const PORTAL = 'https://portal.apphandoff.com'
 
 /** Writes whose results can carry the id of a message this chat just wrote. */
 const WRITE_TOOLS = new Set(['ticket', 'message', 'plan'])
@@ -115,6 +114,11 @@ export type InboxState = {
    * tickets are read one `get` each, as before HO-19546. Memory only: a new chat tries the list again.
    */
   watchReadOff: boolean
+  /**
+   * The board refused (or half answered) a poll that carries the watch and the first notice page in
+   * one call (HO-21344): each is its own call again. Memory only: a new chat, or /inbox resume, tries again.
+   */
+  combinedOff: boolean
   /** Per project: the approvals waiting on a person, as the last watch read counted them. Memory only. */
   pendingProposals: Record<string, PendingProposals>
   /** Board questions this chat asked about a person's message, until the answer wakes it (HO-19659). */
@@ -153,6 +157,7 @@ export function initialState(sessionId: string, now: number): InboxState {
     approvalsOff: false,
     guidanceRev: null,
     watchReadOff: false,
+    combinedOff: false,
     pendingProposals: {},
     questions: [],
     claimOff: false,
@@ -162,6 +167,12 @@ export function initialState(sessionId: string, now: number): InboxState {
 }
 
 export const agentIdOf = (sessionId: string) => `cc:${sessionId}`
+
+/**
+ * The rule-table revision a board call carries: the one the chat learned, else none (HO-21361).
+ * The board applies a write sent without one (with a warning) but refuses a made-up value.
+ */
+const revOf = (state: InboxState) => (state.guidanceRev ? { guidance_rev: state.guidanceRev } : {})
 
 export function isOff(value: string | undefined): boolean {
   return ['off', '0', 'false', 'no'].includes((value ?? '').trim().toLowerCase())
@@ -419,14 +430,74 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
     }
   }
   if (name.tool !== 'ticket' || call.args.dry_run === true) return { state: next, changed, authResumed, evicted }
+  const project = projectHint(call.args, json)
+  // `ticket { ops }` (HO-21342): each op whose result is ok teaches what the same single op would.
+  // A refused or not-run op teaches nothing; the batch answer carries no card and no lease time.
+  const batch = batchedOps(call.args, json)
+  if (batch) {
+    for (const { op, entry } of batch) {
+      const ref = normalizeRef(op.ref) ?? normalizeRef(entry.ref)
+      // A batched create names its ticket only in its result entry, in the HO-n-slug form.
+      const made = op.action === 'create' && typeof entry.ref === 'string' && /^HO-\d/i.test(entry.ref.trim()) ? [normalizeRef(entry.ref)] : []
+      const r = applyTicketOp(next, op, ref, entry, made.filter((m): m is string => m !== null), project, scope, now)
+      next = r.state
+      changed = changed || r.changed
+      evicted.push(...r.evicted)
+    }
+    return { state: next, changed, authResumed, evicted }
+  }
   const op = isRecord(call.args.op) ? call.args.op : {}
-  const ref = normalizeRef(call.args.ref)
+  const r = applyTicketOp(next, op, normalizeRef(call.args.ref), json, createdTickets(json), project, scope, now)
+  return { state: r.state, changed: changed || r.changed, authResumed, evicted: [...evicted, ...r.evicted] }
+}
+
+/**
+ * The ops of a `ticket { ops }` call whose result entry is ok, each with that entry (`results[i]`,
+ * matched by its `i`, else by position): `{results: [{i, ok: true, ref?, rev?} | {i, ok: false, …} |
+ * {i, not_run: true}]}`. Null when the call is not a batch; a refused, not-run or dry-run op is left out
+ * (a `dry_run` list, or an entry `{i, ok: true, dry_run: true}`: nothing was written).
+ */
+export function batchedOps(
+  args: Record<string, unknown>,
+  json: unknown,
+): { op: Record<string, unknown>; entry: Record<string, unknown> }[] | null {
+  const ops = args.ops
+  if (!Array.isArray(ops)) return null
+  const results = isRecord(json) && Array.isArray(json.results) && args.dry_run !== true ? json.results : []
+  const out: { op: Record<string, unknown>; entry: Record<string, unknown> }[] = []
+  results.forEach((entry, at) => {
+    if (!isRecord(entry) || entry.ok !== true || entry.dry_run === true) return
+    const op: unknown = ops[typeof entry.i === 'number' && Number.isInteger(entry.i) ? entry.i : at]
+    if (isRecord(op)) out.push({ op, entry })
+  })
+  return out
+}
+
+/**
+ * What one landed ticket op teaches the watched set: a claim watches and holds its lease, a create
+ * watches what it created, a release or close ends the watch, a move into or out of in_progress takes
+ * or ends the lease. `answer` is the single answer or the batch's result entry (lease and stage are read
+ * from it, else from the op).
+ */
+function applyTicketOp(
+  state: InboxState,
+  op: Record<string, unknown>,
+  ref: string | null,
+  answer: unknown,
+  created: readonly string[],
+  project: string | null,
+  scope: RowScope,
+  now: number,
+): { state: InboxState; changed: boolean; evicted: string[] } {
+  let next = state
+  let changed = false
+  const evicted: string[] = []
   // A move out of in_progress releases the lease (releasesLease); a move into it takes one (HO-19659).
   if (op.action === 'move' && ref) {
-    const card = isRecord(json) && isRecord(json.card) ? json.card : null
+    const card = isRecord(answer) && isRecord(answer.card) ? answer.card : null
     const stage = typeof card?.stage === 'string' ? card.stage : typeof op.stage === 'string' ? op.stage : null
     if (stage === 'in_progress') {
-      const until = leaseUntilIn(json)
+      const until = leaseUntilIn(answer)
       if (until !== null) next = holdLease(next, ref, until)
     } else if (stage) {
       next = holdLease(next, ref, null)
@@ -434,18 +505,17 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
   }
   if (op.action === 'claim' && ref) {
     // A builder's claim starts the chat's watch too (HO-19657): the chat spawned it and waits on its ticket.
-    const r = watch(next, ref, projectHint(call.args, json), now)
+    const r = watch(next, ref, project, now)
     // ... and its lease is the chat's own: a wake needs no claim of the plugin's while it runs (HO-19659).
-    next = holdLease(r.state, ref, leaseUntilIn(json))
+    next = holdLease(r.state, ref, leaseUntilIn(answer))
     evicted.push(...r.evicted)
     changed = true
   } else if (scope === 'subagent' && op.action !== 'close') {
     // A builder's release keeps the watch (the chat still waits on the ticket) but ends its lease; its creates are not watched.
     if (op.action === 'release' && ref) next = holdLease(next, ref, null)
-    return { state: next, changed, authResumed, evicted }
   } else if (op.action === 'create') {
-    for (const created of createdTickets(json)) {
-      const r = watch(next, created, projectHint(call.args, json), now)
+    for (const made of created) {
+      const r = watch(next, made, project, now)
       next = r.state
       evicted.push(...r.evicted)
       changed = true
@@ -454,7 +524,7 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
     ;({ state: next } = unwatch(next, ref))
     changed = true
   }
-  return { state: next, changed, authResumed, evicted }
+  return { state: next, changed, evicted }
 }
 
 export function watch(
@@ -574,11 +644,34 @@ export function claimFailed(state: InboxState, w: Watched, text: string, now: nu
 /** `ticket {op: claim}` for the chat: its own agent id, so the holder is the chat's. */
 export function claimArgs(w: Watched, state: InboxState): Record<string, unknown> {
   return {
-    guidance_rev: state.guidanceRev ?? 'unknown',
+    ...revOf(state),
     ref: w.id ?? w.ref,
     ...(w.projectId && { project_id: w.projectId }),
     agent_id: agentIdOf(state.sessionId),
     op: { action: 'claim', paths: CLAIM_PATHS, note: CLAIM_NOTE },
+  }
+}
+
+/**
+ * The tickets released when the chat ends (HO-21360): those whose lease the chat (its own claim, a
+ * builder's, or the plugin's) still holds, as its own answers last said. Only a live lease: while it
+ * runs no other agent can take one on that ticket, so the release (which drops every claim of the
+ * connection's on it) takes nobody else's. Not seen: a person who released the ticket or moved it on
+ * meanwhile, after which another chat on the same connection may have claimed it. Standby's claims
+ * (not watched tickets) are left to lapse.
+ */
+export function heldLeases(state: InboxState, now: number): Watched[] {
+  return state.watched.filter((w) => w.heldUntil != null && w.heldUntil > now)
+}
+
+/** `ticket {op: release}` for the chat, under its own agent id. */
+export function releaseArgs(w: Watched, state: InboxState): Record<string, unknown> {
+  return {
+    ...revOf(state),
+    ref: w.id ?? w.ref,
+    ...(w.projectId && { project_id: w.projectId }),
+    agent_id: agentIdOf(state.sessionId),
+    op: { action: 'release' },
   }
 }
 
@@ -684,6 +777,47 @@ export type ApprovalWait = {
   decided: ApprovalDecision | null
 }
 
+const nonEmpty = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v : null)
+
+/**
+ * A gated write the human has not decided: the flat, success-shaped answer
+ * `{awaiting_approval: true, proposal_id, portal_url, …}` (the card fields, when
+ * the caller got a card, sit at the same top level). Nothing was applied.
+ */
+export const isAwaitingApproval = (json: unknown): json is Record<string, unknown> =>
+  isRecord(json) && json.awaiting_approval === true
+
+/**
+ * The human gate on a write, when the answer carries one: the awaiting result,
+ * or a `PROPOSAL_PENDING` error (a different proposal already waits on the
+ * target). The link is kept only when it is on the portal origin; otherwise
+ * `url` is empty.
+ */
+export function approvalIn(json: unknown): { proposal_id: string; url: string; to_status: string | null } | null {
+  if (!isRecord(json)) return null
+  const root = isRecord(json.refusal) ? json.refusal : json
+  const awaiting = isAwaitingApproval(json)
+  if (!awaiting && nonEmpty(root.code) !== 'PROPOSAL_PENDING') return null
+  const appr = isRecord(root.approval) ? root.approval : null
+  const proposal_id = awaiting ? nonEmpty(json.proposal_id) : nonEmpty(appr?.ref)
+  if (!proposal_id) return null
+  const link = awaiting ? nonEmpty(json.portal_url) : nonEmpty(appr?.url)
+  return {
+    proposal_id,
+    url: link?.startsWith(`${PORTAL}/`) ? link : '',
+    to_status: awaiting ? nonEmpty(json.to_status) : null,
+  }
+}
+
+/** `decide_lifecycle_proposal`'s reply: which proposal ended, and how. */
+export function decisionIn(json: unknown): { proposal_id: string; status: 'applied' | 'rejected' } | null {
+  if (!isRecord(json)) return null
+  const id = nonEmpty(json.proposal_id)
+  const s = json.status
+  if (!id || (s !== 'applied' && s !== 'rejected')) return null
+  return { proposal_id: id, status: s }
+}
+
 const ISO_TS = /^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:?\d\d)?$/
 const isoOrNull = (v: unknown): string | null => (typeof v === 'string' && ISO_TS.test(v) ? v : null)
 
@@ -714,19 +848,19 @@ export function approvalAsked(tool: string, call: ToolCallSeen, now: number): Ap
   const op = isRecord(call.args.op) ? call.args.op : {}
   if (op.action !== 'milestone_move' && op.action !== 'milestone_drop') return null
   const json = parseJson(call.text)
-  const gate = approvalIn(json, now, '')
+  const gate = approvalIn(json)
   if (!gate) return null
   // The flat awaiting result is its own card: kind and the card fields sit at the root.
   const card = isAwaitingApproval(json) ? json : null
   if (card && typeof card.kind === 'string' && !MILESTONE_KINDS.has(card.kind)) return null
   const fromOp = op.action === 'milestone_drop' ? 'dropped' : typeof op.status === 'string' ? op.status : null
-  const toStatus = gate.approval.to_status && APPROVAL_TARGETS.has(gate.approval.to_status) ? gate.approval.to_status : fromOp
+  const toStatus = gate.to_status && APPROVAL_TARGETS.has(gate.to_status) ? gate.to_status : fromOp
   if (!toStatus || !APPROVAL_TARGETS.has(toStatus)) return null
   const projectId =
     (typeof call.args.project_id === 'string' && UUID.test(call.args.project_id) ? call.args.project_id.toLowerCase() : null) ??
-    (gate.approval.url ? projectOfLink(gate.approval.url) : null)
+    (gate.url ? projectOfLink(gate.url) : null)
   return {
-    proposalId: gate.approval.proposal_id,
+    proposalId: gate.proposal_id,
     ms: msRefOf(call.args.ref),
     projectId,
     toStatus,
@@ -813,19 +947,21 @@ export function noticePlan(state: InboxState): NoticeRequest[] {
  */
 export function noticeArgs(req: NoticeRequest, state: InboxState): Record<string, unknown> {
   return {
-    guidance_rev: state.guidanceRev ?? 'unknown',
+    ...revOf(state),
     ...(req.projectId && { project_id: req.projectId }),
     agent_id: agentIdOf(state.sessionId),
-    op: {
-      action: 'notify_config',
-      include_missed: true,
-      missed_min_tier: 'high',
-      missed_since: req.since,
-      ...(req.before && { missed_before: req.before }),
-      missed_limit: NOTICE_LIMIT,
-    },
+    op: { action: 'notify_config', ...noticeFields(req) },
   }
 }
+
+/** The op keys that ask for one notice page; the watch fields ride beside them in a combined call (HO-21344). */
+const noticeFields = (req: NoticeRequest) => ({
+  include_missed: true,
+  missed_min_tier: 'high',
+  missed_since: req.since,
+  ...(req.before && { missed_before: req.before }),
+  missed_limit: NOTICE_LIMIT,
+})
 
 export type Notice = {
   id: string
@@ -1034,7 +1170,7 @@ export function drivenTouched(tool: string, call: ToolCallSeen): DrivenSighting 
   if (!ms && !milestoneId) return null
   const json = parseJson(call.text)
   const facts = milestoneFacts(json)
-  const link = approvalIn(json, 0, '')?.approval.url
+  const link = approvalIn(json)?.url
   const landed = !isAwaitingApproval(json)
   const toStatus = op.action === 'milestone_move' ? op.status : null
   return {
@@ -1493,7 +1629,7 @@ export function noteStandbyCap(state: InboxState, now: number): { state: InboxSt
 /** `question {op: list, filter: target}`: the open board questions on the ticket. */
 export function standbyQuestionArgs(c: StandbyCandidate, state: InboxState): Record<string, unknown> {
   return {
-    guidance_rev: state.guidanceRev ?? 'unknown',
+    ...revOf(state),
     project_id: c.projectId,
     agent_id: agentIdOf(state.sessionId),
     op: { action: 'list', filter: 'target', target: standbyLabel(c), limit: 5 },
@@ -1509,7 +1645,7 @@ export function openQuestionsIn(json: unknown): boolean | null {
 /** The same claim as the owning chat's, under this chat's agent id, with the standby's note. */
 export function standbyClaimArgs(c: StandbyCandidate, state: InboxState): Record<string, unknown> {
   return {
-    guidance_rev: state.guidanceRev ?? 'unknown',
+    ...revOf(state),
     ref: c.ticketId ?? standbyLabel(c),
     project_id: c.projectId,
     agent_id: agentIdOf(state.sessionId),
@@ -1563,7 +1699,7 @@ function startStandbyWake(
  * that ticket's messages are handled and never tried again. A read-only connection stops the standby. A claim the
  * board refuses for good drops an agent's messages and still wakes the chat, without the claim, for a person's
  * (it must reach them). A claim that fails in passing is counted against the message and given up on after
- * STANDBY_CLAIM_TRIES (rate limits and sign-in trouble are not the message's fault and do not count).
+ * STANDBY_CLAIM_TRIES (rate limits, sign-in trouble and a call that timed out are not the message's fault and do not count).
  */
 export function applyStandbyClaim(
   state: InboxState,
@@ -1595,7 +1731,7 @@ export function applyStandbyClaim(
       return { ...startStandbyWake(rest, next, people, now, false), toast: null }
     }
     default: {
-      if (retryAfterMs(outcome.text) !== null || isAuthError(outcome.text)) return nothing(state)
+      if (retryAfterMs(outcome.text) !== null || isAuthError(outcome.text) || isTimeout(outcome.text)) return nothing(state)
       const tries = c.attempts + 1
       if (tries >= STANDBY_CLAIM_TRIES) return nothing(standbyHandled(state, [c]))
       return nothing({ ...state, standby: { ...sb, queue: sb.queue.map((q) => (q.messageId === c.messageId ? { ...q, attempts: tries } : q)) } })
@@ -1881,12 +2017,15 @@ export function watchPlan(state: InboxState): WatchRequest[] {
 
 export function watchArgs(req: WatchRequest, state: InboxState): Record<string, unknown> {
   return {
-    guidance_rev: state.guidanceRev ?? 'unknown',
+    ...revOf(state),
     project_id: req.projectId,
     agent_id: agentIdOf(state.sessionId),
-    op: { action: 'notify_config', watch: req.refs, since: req.since },
+    op: { action: 'notify_config', ...watchFields(req) },
   }
 }
+
+/** The op keys that ask for the watch list; the notice fields ride beside them in a combined call (HO-21344). */
+const watchFields = (req: WatchRequest) => ({ watch: req.refs, since: req.since })
 
 /** A portal link worth showing: https, no spaces or control characters. */
 const safeUrl = (v: unknown): string | null =>
@@ -2009,6 +2148,60 @@ export const stopWatchReads = (state: InboxState): InboxState => ({ ...state, wa
  */
 export const watchRefused = (text: string): boolean =>
   isScopeRefusal(text) || (refusalOf(text)?.code === 'OP_INVALID' && /\b(?:watch|since)\b/i.test(text))
+
+// ── the watch and the first notice page in one call (HO-21344) ───────────
+// The board answers both sections of one `notify_config` that carries `watch` + `since` and
+// `include_missed`, so a project that needs both in a poll sends one call, not two. Only the
+// first notice page rides along: later pages (next_before) stay notice-only calls.
+
+/** A notice page read together with the watch list, and the ask that fetched it. */
+export type NoticeFirst = { ask: NoticeRequest; page: NoticePage }
+
+/** The notice request a project's first page starts from: the resumed walk's `before` when a capped walk left one. */
+export function firstNoticeAsk(req: NoticeRequest, state: InboxState): NoticeRequest {
+  const before = state.noticeWalks[req.projectId ?? '']?.before
+  return before ? { ...req, before } : req
+}
+
+/** Whether a page fetched for `a` answers the first page `b` asks for now. */
+export const sameNoticeAsk = (a: NoticeRequest, b: NoticeRequest): boolean =>
+  a.projectId === b.projectId && a.since === b.since && a.before === b.before
+
+/** The notice page to read with this project's watch call, or null: none due, approvals off, or the combined call is off. */
+export function combinedNotice(state: InboxState, watch: WatchRequest): NoticeRequest | null {
+  if (state.combinedOff) return null
+  const due = noticePlan(state).find((n) => n.projectId === watch.projectId)
+  return due ? firstNoticeAsk(due, state) : null
+}
+
+export function combinedArgs(watch: WatchRequest, notice: NoticeRequest, state: InboxState): Record<string, unknown> {
+  return {
+    ...revOf(state),
+    project_id: watch.projectId,
+    agent_id: agentIdOf(state.sessionId),
+    op: { action: 'notify_config', ...watchFields(watch), ...noticeFields(notice) },
+  }
+}
+
+/** A combined answer, split into the two answers the separate calls give; null unless it carries both. */
+export function combinedIn(json: unknown): { watch: WatchAnswer; notices: NoticePage } | null {
+  const watch = watchIn(json)
+  const notices = noticesIn(json)
+  return watch && notices ? { watch, notices } : null
+}
+
+/**
+ * This board cannot take the watch and the notice read in one call: a scope refusal, or the older server's
+ * OP_INVALID naming one of the combined keys. It cannot say which part, so neither the watch list nor the
+ * approvals are switched off by it: each is asked on its own. Any other refusal (not found, no access, a stale
+ * revision that outlived its retry) says nothing about combining: it is that tick's alone.
+ */
+export const combinedRefused = (text: string): boolean =>
+  isScopeRefusal(text) ||
+  (refusalOf(text)?.code === 'OP_INVALID' && /\b(?:watch|since|include_missed|missed_(?:since|before|min_tier|limit))\b/i.test(text))
+
+/** The combined call is unavailable on this connection: the watch and the notices are their own calls from now on. */
+export const stopCombinedReads = (state: InboxState): InboxState => ({ ...state, combinedOff: true })
 
 export function pollArgs(req: PollRequest, state: InboxState): Record<string, unknown> {
   return {
@@ -2311,7 +2504,7 @@ export const AUTH_TOAST =
 
 export function resume(state: InboxState): InboxState {
   const standby = state.standby ? { ...state.standby, wakeTimes: [], capNoted: false } : null
-  return { ...state, paused: null, wakeTimes: [], approvalsOff: false, watchReadOff: false, claimOff: false, standby }
+  return { ...state, paused: null, wakeTimes: [], approvalsOff: false, watchReadOff: false, combinedOff: false, claimOff: false, standby }
 }
 
 // ── polling health ───────────────────────────────────────────────────────
