@@ -1283,10 +1283,10 @@ function questionLearned(state: InboxState, call: ToolCallSeen, json: unknown, n
     const projectId = lowerUuid(call.args.project_id) ?? lowerUuid(projectOf(json)) ?? (typeof card.portal_url === 'string' ? projectOfLink(card.portal_url) : null)
     // A question about a ticket the standby woke this chat for carries the steps for a yes (HO-19660).
     const target = typeof op.target === 'string' ? normalizeRef(op.target) : null
-    const wokenKey = target && /^HO-\d+$/.test(target) && projectId ? `${projectId}:${target.slice(3)}` : null
+    const wokenSlot = target && /^HO-\d+$/.test(target) && projectId ? `${projectId}:${target.slice(3)}` : null
     const woken = state.standby?.woken ?? []
-    const noClaim = wokenKey !== null && woken.includes(`${wokenKey}${STANDBY_NO_CLAIM}`)
-    const standbyTicket = target && wokenKey && (noClaim || woken.includes(wokenKey)) ? target : null
+    const noClaim = wokenSlot !== null && woken.includes(`${wokenSlot}${STANDBY_NO_CLAIM}`)
+    const standbyTicket = target && wokenSlot && (noClaim || woken.includes(wokenSlot)) ? target : null
     const added: QuestionWait[] = [...new Set(refs)].map((ref) => ({
       ref,
       projectId,
@@ -1676,20 +1676,20 @@ function startStandbyWake(
 ): { state: InboxState; wake: StandbyCandidate[]; claimed: boolean } {
   const ids = bundle.map((b) => b.messageId)
   const first = bundle[0] as StandbyCandidate
-  const key = standbyKey(first)
+  const slot = standbyKey(first)
   // `~` marks a ticket woken for with no claim taken: a yes later has nothing to release.
-  const mark = claimed ? key : `${key}${STANDBY_NO_CLAIM}`
+  const mark = claimed ? slot : `${slot}${STANDBY_NO_CLAIM}`
   return {
     state: {
       ...state,
-      wakeInFlight: [`standby:${key}`],
+      wakeInFlight: [`standby:${slot}`],
       lastActivityAt: now,
       standby: {
         ...sb,
         queue: sb.queue.filter((q) => !ids.includes(q.messageId)),
         inFlight: bundle,
         wakeTimes: [...standbyRecent(sb, now), now],
-        woken: [...sb.woken.filter((k) => k !== key && k !== `${key}${STANDBY_NO_CLAIM}`), mark].slice(-STANDBY_WOKEN_KEPT),
+        woken: [...sb.woken.filter((k) => k !== slot && k !== `${slot}${STANDBY_NO_CLAIM}`), mark].slice(-STANDBY_WOKEN_KEPT),
         capNoted: false,
       },
     },
