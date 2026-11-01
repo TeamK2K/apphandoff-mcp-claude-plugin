@@ -2,8 +2,8 @@
 // ./register.ts collects the ids, asks the board, caches the answers and hands the drawing
 // a map; this file only decides what text a reply is drawn with.
 //
-// A reply that says `HO-20342` draws as `[🔵 HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`
-// once the title is known; `MS-n` carries a 🟣 and `PG-n` a 🟠 (a program's `name` stands for its title).
+// A reply that says `HO-20342` draws as `[HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`
+// once the title is known; `MS-n` and `PG-n` the same (a program's `name` stands for its title). No dot leads the link.
 // An id the Mac hook already linked (`[HO-n](https://portal.apphandoff.com/HO-n)`)
 // gains the dot and the title inside its link text; an id in a fenced block, in inline code, in any other link
 // or inside any URL is left as it was.
@@ -24,8 +24,15 @@ export const MISS_TTL_MS = 24 * 60 * 60 * 1000
 /** After a failed lookup (not a not-found) nothing is asked for this long. */
 export const RETRY_MS = 2 * 60 * 1000
 
-/** The dot drawn at the start of a titled link's text, by the id's kind. */
-export const DOTS: Record<string, string> = { HO: '🔵', MS: '🟣', PG: '🟠' }
+/** A reply holding this word draws its ids as written, and the word itself is hidden; the next reply draws titles again. */
+export const NO_HIGHLIGHT = 'no-hl-plz'
+
+export const wantsNoHighlight = (text: string): boolean => text.includes(NO_HIGHLIGHT)
+
+/** The reply with every marker removed, and the space it leaves behind folded. */
+export function stripNoHighlight(text: string): string {
+  return text.replace(/[ \t]*no-hl-plz[ \t]*/g, (m) => (/^[ \t]/.test(m) && /[ \t]$/.test(m) ? ' ' : '')).replace(/^\n+/, '')
+}
 
 /** `HO-12`, `MS-3` or `PG-1` to its shortened title. */
 export type Titles = Record<string, string>
@@ -89,7 +96,7 @@ function parseLink(link: string): { text: string; url: string } | null {
   return m ? { text: m[1] ?? '', url: m[2] ?? '' } : null
 }
 
-const linkOf = (ref: string, title: string) => `[${DOTS[ref.slice(0, 2)]} ${ref} · ${escapeLinkText(title)}](${PORTAL}${ref})`
+const linkOf = (ref: string, title: string) => `[${ref} · ${escapeLinkText(title)}](${PORTAL}${ref})`
 
 /**
  * Walks the prose of a text (never a fenced block, never inline code), calling `titleOf` for each

@@ -855,7 +855,8 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     let text: string | null = null
     try {
-      if (!titlesOff && titles.mayHaveRefs(e.props.text)) {
+      if (titles.wantsNoHighlight(e.props.text)) text = titles.stripNoHighlight(e.props.text)
+      else if (!titlesOff && titles.mayHaveRefs(e.props.text)) {
         const { value } = await $.state.get(TITLES)
         const drawn = value ? titles.rewrite(e.props.text, value) : e.props.text
         if (drawn !== e.props.text) text = drawn
