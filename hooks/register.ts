@@ -635,7 +635,8 @@ async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise
 
 // ── ticket titles (HO-22951) ─────────────────────────────────────────────
 //
-// A reply's `HO-n` is drawn with the ticket's title beside it (./ticket-titles.ts decides the text).
+// A reply's `HO-n`, `MS-n` and `PG-n` are drawn with the title (a program's name) and a dot of their kind beside
+// them (HO-22968; ./ticket-titles.ts decides the text). Cache keys keep the `ticket-title:` prefix and the state key `ticketTitles`.
 // The ids are collected here, off the drawing path, from the assistant rows as they are appended; the
 // ones no cache knows are asked of the board in batches of 10 (`get {refs, view: 'card'}`, a read) on
 // the connection the inbox learned; the answers are cached across chats in `$.store` (keys
