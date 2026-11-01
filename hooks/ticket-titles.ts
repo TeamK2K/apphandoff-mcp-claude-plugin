@@ -1,10 +1,11 @@
-// Ticket titles beside HO ids in a reply (HO-22951). Pure, no `$`: the wiring in
+// Ticket, milestone and program titles beside HO/MS/PG ids in a reply (HO-22951, HO-22968). Pure, no `$`: the wiring in
 // ./register.ts collects the ids, asks the board, caches the answers and hands the drawing
 // a map; this file only decides what text a reply is drawn with.
 //
-// A reply that says `HO-20342` draws as `[HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`
-// once the title is known. An id the Mac hook already linked (`[HO-n](https://portal.apphandoff.com/HO-n)`)
-// gains the title inside its link text; an id in a fenced block, in inline code, in any other link
+// A reply that says `HO-20342` draws as `[🔵 HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`
+// once the title is known; `MS-n` carries a 🟣 and `PG-n` a 🟠 (a program's `name` stands for its title).
+// An id the Mac hook already linked (`[HO-n](https://portal.apphandoff.com/HO-n)`)
+// gains the dot and the title inside its link text; an id in a fenced block, in inline code, in any other link
 // or inside any URL is left as it was.
 
 export const PORTAL = 'https://portal.apphandoff.com/'
@@ -23,7 +24,10 @@ export const MISS_TTL_MS = 24 * 60 * 60 * 1000
 /** After a failed lookup (not a not-found) nothing is asked for this long. */
 export const RETRY_MS = 2 * 60 * 1000
 
-/** `HO-12` to its shortened title. */
+/** The dot drawn at the start of a titled link's text, by the id's kind. */
+export const DOTS: Record<string, string> = { HO: '🔵', MS: '🟣', PG: '🟠' }
+
+/** `HO-12`, `MS-3` or `PG-1` to its shortened title. */
 export type Titles = Record<string, string>
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -72,12 +76,12 @@ export const escapeLinkText = (s: string) =>
 
 // ── the rewrite ──────────────────────────────────────────────────────────
 
-/** Cheap pre-check: a text with no `HO-<digit>` cannot change. */
-export const mayHaveRefs = (text: string) => /HO-\d/.test(text)
+/** Cheap pre-check: a text with no `HO-`, `MS-` or `PG-` followed by a digit cannot change. */
+export const mayHaveRefs = (text: string) => /(?:HO|MS|PG)-\d/.test(text)
 
 // A link's text may hold escapes (`\[`, `\]`), which is how a title with brackets is drawn; a bare id right after `[` is a link's text, not prose.
-const ANY = /(!?\[(?:\\.|[^\]\n\\])*\]\([^)\n]*\))|(?<![A-Za-z0-9_/.\-#@:=?&%~+[])HO-([1-9]\d{0,8})(?![A-Za-z0-9_]|-[A-Za-z0-9])/g
-const PORTAL_URL = /^<?https:\/\/portal\.apphandoff\.com\/(HO-[1-9]\d{0,8})\/?>?$/
+const ANY = /(!?\[(?:\\.|[^\]\n\\])*\]\([^)\n]*\))|(?<![A-Za-z0-9_/.\-#@:=?&%~+[])((?:HO|MS|PG)-[1-9]\d{0,8})(?![A-Za-z0-9_]|-[A-Za-z0-9])/g
+const PORTAL_URL = /^<?https:\/\/portal\.apphandoff\.com\/((?:HO|MS|PG)-[1-9]\d{0,8})\/?>?$/
 
 /** One `[text](url "title")`: its text, and the url without its optional title. */
 function parseLink(link: string): { text: string; url: string } | null {
@@ -85,15 +89,15 @@ function parseLink(link: string): { text: string; url: string } | null {
   return m ? { text: m[1] ?? '', url: m[2] ?? '' } : null
 }
 
-const linkOf = (ref: string, title: string) => `[${ref} · ${escapeLinkText(title)}](${PORTAL}${ref})`
+const linkOf = (ref: string, title: string) => `[${DOTS[ref.slice(0, 2)]} ${ref} · ${escapeLinkText(title)}](${PORTAL}${ref})`
 
 /**
  * Walks the prose of a text (never a fenced block, never inline code), calling `titleOf` for each
- * id that may be given a title: a bare `HO-n`, or one portal link whose text is exactly `HO-n`.
+ * id that may be given a title: a bare `HO-n`, `MS-n` or `PG-n`, or one portal link whose text is exactly that id.
  * Answers the rewritten text and the ids met, in order, once each.
  */
 function scanProse(prose: string, titleOf: (ref: string) => string | undefined, refs: Set<string>): string {
-  return prose.replace(ANY, (whole, link: string | undefined, digits: string | undefined) => {
+  return prose.replace(ANY, (whole, link: string | undefined, bare: string | undefined) => {
     if (link !== undefined) {
       const parsed = parseLink(link)
       const ref = parsed ? PORTAL_URL.exec(parsed.url)?.[1] : undefined
@@ -103,7 +107,7 @@ function scanProse(prose: string, titleOf: (ref: string) => string | undefined, 
       const title = titleOf(ref)
       return title ? linkOf(ref, title) : whole
     }
-    const ref = `HO-${digits}`
+    const ref = bare as string
     refs.add(ref)
     const title = titleOf(ref)
     return title ? linkOf(ref, title) : whole
@@ -203,7 +207,7 @@ function walk(text: string, titleOf: (ref: string) => string | undefined, refs: 
   return out.join('\n')
 }
 
-/** The ticket ids a text names outside code, in order, once each. */
+/** The HO, MS and PG ids a text names outside code, in order, once each. */
 export function refsIn(text: string): string[] {
   if (!mayHaveRefs(text)) return []
   const refs = new Set<string>()
@@ -236,17 +240,19 @@ export const isGetAnswer = (json: unknown) => isRecord(json) && Array.isArray(js
 
 /**
  * What a `get` answer says about the refs asked: a title (shortened) for each card that came
- * back with one, `null` for each ref asked that came back as no card at all (not found, another
- * project, no access). Null when the body is not an answer.
+ * back with one (a program's `name` where it has no `title`), `null` for each ref asked that came
+ * back as no card at all (not found, another project, no access). Null when the body is not an answer.
  */
 export function readAnswer(json: unknown, asked: readonly string[]): Record<string, string | null> | null {
   if (!isRecord(json) || !Array.isArray(json.items)) return null
   const out: Record<string, string | null> = Object.fromEntries(asked.map((r) => [r, null]))
   for (const item of json.items) {
-    if (!isRecord(item) || typeof item.ref !== 'string' || typeof item.title !== 'string') continue
+    if (!isRecord(item) || typeof item.ref !== 'string') continue
+    const raw = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : null
+    if (raw === null) continue
     const ref = item.ref.trim().toUpperCase()
     if (!(ref in out)) continue
-    const title = shortTitle(item.title)
+    const title = shortTitle(raw)
     if (title !== '') out[ref] = title
   }
   return out
