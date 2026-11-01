@@ -67,8 +67,9 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
 - It shows a status line and toasts, on your screen only.
 - Once the chat has used your AppHandoff connection, it draws each `HO-<n>` (ticket),
   `MS-<n>` (milestone) and `PG-<n>` (program) in a reply with its title (a program's name)
-  beside it, as a link on the portal, led by a dot for the kind: 🔵 ticket, 🟣 milestone,
-  🟠 program (display only; the stored message is untouched, and ids in code are left alone).
+  beside it, as a link on the portal (display only; the stored message is untouched, and ids
+  in code are left alone). A reply that holds the word `no-hl-plz` draws its ids as written,
+  with the word hidden; the next reply draws titles again.
   For that it reads the titles of the
   ids it has not seen with `get` calls on your own connection, up to 10 ids per call, which
   change nothing on your board. An id the board does not answer for stays as written.
@@ -126,7 +127,7 @@ release.
   `~/.claude/settings.json`, then start a new chat; it loads idle.
 - Titles beside `HO-<n>`, `MS-<n>` and `PG-<n>` (and the `get` reads behind them): set
   `APPHANDOFF_TICKET_TITLES=off` the same way; ids then draw as written and nothing is looked up.
-  `APPHANDOFF_INBOX=off` stops them too.
+  `APPHANDOFF_INBOX=off` stops them too. For one reply: put `no-hl-plz` in it.
 - Remove it: `/plugin uninstall apphandoff@apphandoff`, then start a new chat.
 
 ## License
