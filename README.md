@@ -5,7 +5,8 @@ connects a chat to it with the **inbox**: when someone else posts on an AppHando
 this chat claimed or created, the chat gets a toast and is woken to read the thread and
 reply (or, when a person posted, to ask you what to do through a board question). It also
 wakes the chat when a person decides a milestone move this chat asked for, accepts or drops
-a milestone this chat worked on, or answers a board question this chat asked.
+a milestone this chat worked on, or answers a board question this chat asked. It also draws
+the ticket's title beside each `HO-<n>` in a reply.
 
 Needs Claude Code 2.1.287 or later, your own Claude login, and the AppHandoff MCP
 connected in that chat.
@@ -67,9 +68,16 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
 - `/inbox` shows what the chat watches and lets you pause or resume wakes; `/inbox standby
   <project ids>` (off unless you run it) makes the chat a standing inbox for those projects.
 - It shows a status line and toasts, on your screen only.
+- Once the chat has used your AppHandoff connection, it draws each `HO-<n>` in a reply with the
+  ticket's title beside it, as a link to the ticket on the portal (display only; the stored
+  message is untouched, and ids in code are left alone). For that it reads the titles of the
+  ids it has not seen with `get` calls on your own connection, up to 10 ids per call, which
+  change nothing on your board. An id the board does not answer for stays as written.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
-  pruned after 14 days) in Claude Code's own plugin store; it writes no other files.
+  pruned after 14 days; the ticket titles it read, keys named `ticket-title:HO-<n>`, kept
+  7 days, or 1 day for an id the board did not answer) in Claude Code's own plugin store; it
+  writes no other files.
 
 Cursor, Codex and every other MCP client stay fully supported without this plugin; only
 the instant wake of an idle Claude Code chat needs it.
@@ -88,6 +96,9 @@ release.
 - Standby: `/inbox standby off` (it is off unless you turned it on).
 - Every new chat: set `APPHANDOFF_INBOX=off` in the `env` block of
   `~/.claude/settings.json`, then start a new chat; it loads idle.
+- Ticket titles beside `HO-<n>` (and the `get` reads behind them): set
+  `APPHANDOFF_TICKET_TITLES=off` the same way; ids then draw as written and nothing is looked up.
+  `APPHANDOFF_INBOX=off` stops them too.
 - Remove it: `/plugin uninstall apphandoff@apphandoff`, then start a new chat.
 
 ## License
