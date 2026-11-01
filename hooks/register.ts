@@ -46,8 +46,14 @@ const textOf = (r: McpToolResult) =>
 
 type Answer = { ok: true; json: unknown } | { ok: false; text: string }
 
-/** A board call held to the 60 s limit (HO-21343); the engine's timer is spelled `$.clock.after` here, never passed as `$.clock`. */
-const bounded = <T>($: EngineInterface, call: Promise<T>) => withCallTimeout((ms, fn) => $.clock.after(ms, fn), call)
+/**
+ * One AppHandoff tool call held to the 60 s limit (HO-21343). A top-level function declaration that takes `$`
+ * whole and spells each engine call plainly: the plugin directory reads `$` in no other shape (HO-22974).
+ */
+function callTool($: EngineInterface, server: string, tool: Tool, args: Record<string, unknown>): Promise<McpToolResult> {
+  const call = $.mcp.call(server, tool, args)
+  return withCallTimeout((ms, fn) => $.clock.after(ms, fn), call)
+}
 
 /** Whether a failed poll ends this tick: a sign-in stop, a rate-limit wait, or a call that timed out (a dead link; the next tick tries again). */
 const endsTick = (s: core.InboxState, text: string) => s.authStopped || s.retryAt !== null || isTimeout(text)
@@ -62,7 +68,7 @@ const firstTextOf = (r: McpToolResult) => {
 async function readThread($: EngineInterface, server: string, args: Record<string, unknown>): Promise<Answer> {
   if (state) state = { ...state, calls: state.calls + 1 }
   try {
-    const r = await bounded($, $.mcp.call(server, 'get', args))
+    const r = await callTool($, server, 'get', args)
     if (r.isError) return { ok: false, text: textOf(r) || 'get failed' }
     const card = core.ticketFromCard(core.v3Json(r.structuredContent, firstTextOf(r)))
     return card ? { ok: true, json: card } : { ok: false, text: 'get returned no ticket card' }
@@ -85,7 +91,7 @@ async function boardCall(
   answers: (json: unknown) => boolean,
 ): Promise<Answer> {
   try {
-    const r = await bounded($, $.mcp.call(server, tool, args))
+    const r = await callTool($, server, tool, args)
     const json = core.v3Json(r.structuredContent, firstTextOf(r)) ?? core.parseJson(textOf(r))
     if (!r.isError && !(core.isRecord(json) && typeof json.code === 'string' && !answers(json))) return { ok: true, json }
     return { ok: false, text: textOf(r) || JSON.stringify(json ?? 'message failed') }
@@ -804,8 +810,8 @@ export const register: Register = (on) => {
 
   // A /clear or a resume names the new chat here: its inbox starts from what the store kept under its id,
   // once a poll still running for the ended chat has finished. The newest chat wins over a start still waiting.
+  // The engine's answer passes through untouched: `return next(e)`, never read or changed (HO-22974).
   on('classic.SessionStart', async ($, e, next) => {
-    const result = await next(e)
     try {
       const sessionId = e.session_id || (await $.session.id())
       if (sessionId && sessionId !== state?.sessionId && (e.source === 'clear' || e.source === 'resume')) {
@@ -813,7 +819,7 @@ export const register: Register = (on) => {
         if (!polling) await start($, sessionId)
       }
     } catch {}
-    return result
+    return next(e)
   })
 
   // The chat's own AppHandoff calls teach the add-on everything: which

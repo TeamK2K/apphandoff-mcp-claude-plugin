@@ -13,10 +13,7 @@ connected in that chat.
 
 ## Install
 
-**From the plugin directory.** In Claude Code, run `/plugin`, browse the directory, and
-select AppHandoff.
-
-**From the AppHandoff marketplace (self-hosted).** In a Claude Code chat:
+From the AppHandoff marketplace, in a Claude Code chat:
 
 ```text
 /plugin marketplace add https://apphandoff.com/claude/marketplace.json
@@ -83,6 +80,35 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
 
 Cursor, Codex and every other MCP client stay fully supported without this plugin; only
 the instant wake of an idle Claude Code chat needs it.
+
+## What its hooks call, send and change
+
+- **Tools it calls itself**, all on your own AppHandoff connection, never another server:
+  `message` (a `notify_config` read of what changed on watched tickets and of your notice list,
+  once a poll), `get` (a ticket's thread when the watch read says it changed; titles for the
+  ids in a reply), `ticket` (a claim before a wake, a release when the chat ends) and, only with
+  standby on, `question` (a list read before it asks you about a person's message). It never
+  calls a tool of any other server and never fetches or runs code.
+- **What it sends, and where**: only to that AppHandoff connection: ticket, milestone and
+  question ids, project ids and timestamps the chat's own AppHandoff calls already used, and
+  `cc:<chat id>` as its agent id. Nothing goes to any other host.
+- **What it reads from your machine**: two settings only, `APPHANDOFF_INBOX` and
+  `APPHANDOFF_TICKET_TITLES` (on/off switches); their values are never sent anywhere. It reads
+  no credential: the connection's own sign-in stays with Claude Code.
+- **What it reads from the chat** (the transcript hook on replies and tool results): the
+  chat's own AppHandoff calls and their answers, to learn the connection, the tickets it
+  claimed or created and its own message ids, plus the `HO-`/`MS-`/`PG-` ids in a reply. It
+  changes nothing in the transcript and sends only those ids, as above.
+- **What a wake prompt carries** (submitted into this chat only): fixed instructions plus
+  ticket numbers, author type (agent or person), message ids and times, the project id and
+  the chat's own agent id to answer under; a milestone's id and the decision; a question's
+  id. Never a message's text: the chat reads the thread itself with its own `get`.
+- **What each hook changes**: the chat-start hooks register `/inbox` and start the inbox
+  (after a `/clear` or a resume, the new chat's own); they hand the engine's answer back
+  unchanged. The chat-end hook releases the chat's claims and saves its state. The transcript
+  hook changes nothing. The reply-drawing hook changes only how a reply is drawn on your
+  screen (titles beside ids). `/inbox` shows the watch list, pauses or resumes wakes, and
+  turns standby on or off; it changes only the plugin's own state.
 
 ## Updates
 
