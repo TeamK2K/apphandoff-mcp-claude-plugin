@@ -23,10 +23,12 @@
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
 
+import { update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
 import { isTimeout, withCallTimeout } from './call-timeout'
 import * as core from './inbox-core'
 import { statusWith } from './status-line'
+import * as titles from './ticket-titles'
 
 let state: core.InboxState | null = null
 let timer: { cancel: () => void } | null = null
@@ -69,7 +71,7 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
   }
 }
 
-type Tool = 'message' | 'ticket' | 'question'
+type Tool = 'message' | 'ticket' | 'question' | 'get'
 
 /**
  * One board call: its JSON answer when `answers` takes it, else the failure text. A refusal
@@ -537,10 +539,15 @@ async function tick($: EngineInterface) {
 /** This chat's inbox, from what the store kept under its id, and its first poll; stale keys are pruned. */
 async function start($: EngineInterface, sessionId: string) {
   off = core.isOff(await $.env.get('APPHANDOFF_INBOX'))
+  titlesOff = core.isOff(await $.env.get('APPHANDOFF_TICKET_TITLES'))
+  titleHydration = null
+  titleRetryAt = 0
   const now = await $.clock.now()
   const own = await $.store.get(core.STORE_PREFIX + sessionId)
   pendingCalls.clear()
   state = core.fromStored(sessionId, core.expired(own, now) ? undefined : own, now)
+  // A resumed chat already knows its connection: the cached titles reach the drawing now.
+  syncTitles($)
   const startNo = ++sweepStart
   sweepTimer?.cancel()
   sweepTimer = null
@@ -626,10 +633,133 @@ async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise
   return held.reduce((s, w, i) => (released[i] ? core.holdLease(s, w.ref, null) : s), ending)
 }
 
+// ── ticket titles (HO-22951) ─────────────────────────────────────────────
+//
+// A reply's `HO-n` is drawn with the ticket's title beside it (./ticket-titles.ts decides the text).
+// The ids are collected here, off the drawing path, from the assistant rows as they are appended; the
+// ones no cache knows are asked of the board in batches of 10 (`get {refs, view: 'card'}`, a read) on
+// the connection the inbox learned; the answers are cached across chats in `$.store` (keys
+// `ticket-title:HO-n`, never `session:`, so the inbox's sweeps leave them alone) and handed to the
+// drawing through `$.state`, which redraws the messages that read it. A drawing never writes state and
+// never waits on the board. `APPHANDOFF_TICKET_TITLES=off`, no learned connection, or the inbox
+// itself off: no lookup, ids draw as they are.
+
+/** The drawing's titles: `$.state` (`apphandoff-state.d.ts`), the one value the drawing reads. */
+const TITLES = { plugin: 'apphandoff', key: 'ticketTitles' } as const
+
+let titlesOff = false
+/** What this process knows by ref, with the time it was learned: the shortened title, or null for a ref the board did not answer (negative cache). The TTLs apply on read. */
+const titleKnown = new Map<string, titles.StoredTitle>()
+/** Refs queued or being asked, so a reply that repeats an id asks once. */
+const titleAsking = new Set<string>()
+/** The cached titles' one load into the drawing's state, per chat. */
+let titleHydration: Promise<void> | null = null
+/** A failed lookup (not a not-found) holds every lookup until this time. */
+let titleRetryAt = 0
+/** Lookups run one after another. */
+let titleQueue: Promise<void> = Promise.resolve()
+
+/** The AppHandoff connection titles are read through: the inbox's learned one, and none while either is off. */
+const titleServer = () => (titlesOff || off || !state ? null : core.activeServer(state))
+
+/** The cached titles, not yet expired, into the drawing's state; expired entries are swept. */
+async function hydrateTitles($: EngineInterface) {
+  const now = await $.clock.now()
+  const found: titles.Titles = {}
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(titles.STORE_PREFIX)) continue
+    const entry = titles.fromStored(await $.store.get(key), now)
+    if (!entry) {
+      await $.store.delete(key)
+      continue
+    }
+    const ref = key.slice(titles.STORE_PREFIX.length)
+    titleKnown.set(ref, entry)
+    if (entry.title) found[ref] = entry.title
+  }
+  if (Object.keys(found).length > 0) await update($, TITLES, (current) => titles.mergeTitles(current, found))
+}
+
+/**
+ * One batch: the shortened title of each ref the board answered with a card, null for each it
+ * answered without one. A batch the board fails whole as not found is asked ref by ref (one gone
+ * ref must not hide the others); any other failure holds lookups for a while and answers nothing.
+ */
+async function askBatch($: EngineInterface, server: string, batch: string[]): Promise<Record<string, string | null>> {
+  const r = await boardCall($, server, 'get', titles.lookupArgs(batch), titles.isGetAnswer)
+  if (r.ok) return titles.readAnswer(r.json, batch) ?? {}
+  if (titles.isGone(r.text)) {
+    if (batch.length === 1) return { [batch[0] as string]: null }
+    const out: Record<string, string | null> = {}
+    for (const ref of batch) {
+      const before = titleRetryAt
+      Object.assign(out, await askBatch($, server, [ref]))
+      // Another kind of failure holds lookups: the rest of the batch waits too.
+      if (titleRetryAt !== before) break
+    }
+    return out
+  }
+  titleRetryAt = (await $.clock.now()) + (core.retryAfterMs(r.text) ?? titles.RETRY_MS)
+  return {}
+}
+
+/** Asks the board for `ask` in batches, caches each answer, then hands the new titles to the drawing. Never throws. */
+async function askTitles($: EngineInterface, server: string, ask: string[]) {
+  try {
+    for (const batch of titles.batches(ask)) {
+      if (titleServer() !== server || (await $.clock.now()) < titleRetryAt) return
+      const answered = await askBatch($, server, batch)
+      const now = await $.clock.now()
+      const found: titles.Titles = {}
+      for (const [ref, title] of Object.entries(answered)) {
+        titleKnown.set(ref, titles.toStored(title, now))
+        try {
+          await $.store.set(titles.STORE_PREFIX + ref, titles.toStored(title, now))
+        } catch {}
+        if (title) found[ref] = title
+      }
+      if (Object.keys(found).length > 0) await update($, TITLES, (current) => titles.mergeTitles(current, found))
+    }
+  } catch {
+  } finally {
+    for (const ref of ask) titleAsking.delete(ref)
+  }
+}
+
+/**
+ * Called as rows are appended: loads the cache into the drawing once the connection is learned, and
+ * looks up the ids in `text` (an assistant reply) that no cache knows. Fire and forget; never throws.
+ */
+function syncTitles($: EngineInterface, text?: string) {
+  try {
+    const server = titleServer()
+    if (!server) return
+    // A load that failed is tried again on the next row.
+    titleHydration ??= hydrateTitles($).catch(() => {
+      titleHydration = null
+    })
+    const refs = text ? titles.refsIn(text) : []
+    if (refs.length === 0) return
+    // The `$` of this hook is used after it returns, as the inbox's timers (`schedule` from `learn`) and
+    // `submitWake` already do, and as the reference's own `session.start` example does for a loop that runs on.
+    void titleHydration
+      .then(async () => {
+        const now = await $.clock.now()
+        const fresh = { has: (ref: string) => titles.fromStored(titleKnown.get(ref), now) !== null }
+        const ask = titles.unknownRefs(refs, fresh, titleAsking)
+        if (ask.length === 0) return
+        for (const ref of ask) titleAsking.add(ref)
+        titleQueue = titleQueue.then(() => askTitles($, server, ask))
+      })
+      .catch(() => {})
+  } catch {}
+}
+
 /**
  * The plugin's one hooks module (hooks.json names one per plugin): the inbox.
  * It draws the status line through ./status-line.ts and decides which server
- * is AppHandoff in ./apphandoff-server.ts.
+ * is AppHandoff in ./apphandoff-server.ts. Its ticket titles (HO-22951) are
+ * drawn by the `ui.render` hook below from the cache above.
  */
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
@@ -708,7 +838,23 @@ export const register: Register = (on) => {
         await learn($, seen, scope)
       } catch {}
     }
+    // The reply's ticket ids, now that this row may have taught the connection (HO-22951). A subagent's text is not drawn here.
+    if (e.agentId === undefined) syncTitles($, e.door === 'response' ? core.toolResultText(e.message.content) : undefined)
     return result
+  })
+
+  // A reply's ticket ids drawn with their titles (HO-22951): display only, the stored message is untouched.
+  // The drawing reads the cache from `$.state` (never writes it, never waits on the board) and redraws when a title lands.
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    let text: string | null = null
+    try {
+      if (!titlesOff && titles.mayHaveRefs(e.props.text)) {
+        const { value } = await $.state.get(TITLES)
+        const drawn = value ? titles.rewrite(e.props.text, value) : e.props.text
+        if (drawn !== e.props.text) text = drawn
+      }
+    } catch {}
+    return text === null ? next(e) : next({ ...e, props: { ...e.props, text } })
   })
 
   on('command.run', { command: 'inbox' }, async ($, e) => {
