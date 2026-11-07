@@ -660,7 +660,7 @@ async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise
 // never waits on the board. `APPHANDOFF_TICKET_TITLES=off`, no learned connection, or the inbox
 // itself off: no lookup, ids draw as they are.
 
-/** The drawing's titles: `$.state` (`apphandoff-state.d.ts`), the one value the drawing reads. */
+/** The drawing's titles: `$.state` (`types/index.d.ts`), the one value the drawing reads. */
 const TITLES = { plugin: 'apphandoff', key: 'ticketTitles' } as const
 
 let titlesOff = false
@@ -1144,7 +1144,6 @@ export const register: Register = (on) => {
   // The program view pane: a program picker, Refresh, and the drawing (./pg-client.tsx).
   on('ui.render', { component: 'Pane', requestId: PG_PANE }, async ($, e) => {
     const { Box, Text, Button, Select } = $.ui.resolve(e)
-    const { Client } = $.ui.resolve(e)
     if (e.surface !== 'desktop' && e.surface !== 'terminal') {
       return <Text dimColor>The program view draws on the desktop app and terminal only.</Text>
     }
@@ -1162,8 +1161,9 @@ export const register: Register = (on) => {
     const meta = list.find((p) => p.ref === pg)
     const sums = ms ? pv.totals(ms) : null
     const split = ms ? pv.splitMilestones(ms) : null
-    // The drawing's props and key, built plainly here so the Client element below is a bare tag
-    // with one fixed module (the plugin directory reads it only in that shape).
+    // The drawing's props and key, built plainly here so the Client element below has one fixed module.
+    // The plugin directory reads a Client only in this plain string-tag form, h('Client', { module: './x.tsx' }),
+    // and refuses a Client the module binds itself (HO-24959).
     const clientKey = 'pg-' + pg
     const clientProps =
       pg && ms && sums && split
@@ -1191,7 +1191,7 @@ export const register: Register = (on) => {
               label="Program"
               value={pg}
               options={list.map((p) => ({ value: p.ref, label: `${p.ref} ${p.name}` }))}
-              onSelect={(chosen: string) => {
+              onSelect={(chosen) => {
                 pgProgram = chosen
                 if (!pgView.milestones.has(chosen)) void fetchMilestones($, pick, v, chosen)
                 else void redraw($)
@@ -1204,7 +1204,7 @@ export const register: Register = (on) => {
         {v.programs !== null && !pg && <Text dimColor>No programs on this board.</Text>}
         {pg && ms === undefined && <Text dimColor>Loading {pg} milestones…</Text>}
         {pg && ms === null && <Text dimColor>Could not read {pg} from the board.</Text>}
-        {clientProps && <Client key={clientKey} module="./pg-client.tsx" props={clientProps} />}
+        {clientProps && h('Client', { key: clientKey, module: './pg-client.tsx', props: clientProps })}
       </Box>
     )
   })
