@@ -9,8 +9,8 @@ a milestone this chat worked on, or answers a board question this chat asked. It
 the title beside each `HO-<n>`, `MS-<n>` and `PG-<n>` in a reply, and `/pg` opens a pane with a
 program's progress and its milestones.
 
-Needs Claude Code 2.1.287 or later, your own Claude login, and the AppHandoff MCP
-connected in that chat.
+Needs Claude Code 2.1.287 or later and your own AppHandoff account. The plugin brings the
+AppHandoff MCP connection with it.
 
 ## Install
 
@@ -27,15 +27,24 @@ Or from a terminal, in one go:
 claude plugin marketplace add https://apphandoff.com/claude/marketplace.json && claude plugin install apphandoff@apphandoff
 ```
 
-Start a new chat; `/inbox` shows what it watches.
+Start a new chat; `/inbox` shows what it watches. Then run `/mcp` and sign in to
+`plugin:apphandoff:apphandoff` once, with your own AppHandoff account (not needed when you
+added AppHandoff yourself with `claude mcp add`; see Connect).
 
 ## Connect
 
-The plugin bundles no MCP configuration file: add the AppHandoff MCP connection to
-Claude Code yourself, pointing at `https://api.apphandoff.com/mcp`, and sign in with your
-own AppHandoff account. The tools it serves are the ones Claude Code shows for that connection.
+One install gives you the mod, `/pg` and the AppHandoff tools. The plugin adds the
+AppHandoff MCP connection for you: its `.mcp.json` declares one HTTP server, `apphandoff`, at
+`https://api.apphandoff.com/mcp`. It holds no header, token or secret; you sign in with `/mcp`
+and Claude Code keeps the sign-in.
 
-The plugin learns which tickets and milestones to follow from the chat's own calls on that
+Claude Code connects one server per URL, so you never get a second copy. If you added
+AppHandoff yourself (`claude mcp add apphandoff https://api.apphandoff.com/mcp`), Claude Code
+connects only your entry. The claude.ai AppHandoff connector ranks below a plugin:
+Claude Code uses the plugin's connection instead of a second copy, so sign in to it once with
+`/mcp`. The tools are the ones Claude Code shows for the connection it uses.
+
+The mod learns which tickets and milestones to follow from the chat's own calls on that
 connection, then polls them with calls that change nothing on your board. It makes two
 calls that do change your board: before it wakes the chat for a new message it **claims
 the ticket** for the chat, so two agents never work one ticket at once, and it **releases**
@@ -104,6 +113,10 @@ the instant wake of an idle Claude Code chat needs it.
 - **What it fetches and runs**: it fetches nothing from the internet and runs no program, shell
   command or downloaded code. Its code is the hooks files that ship in this plugin; every read
   goes through your own AppHandoff connection in Claude Code.
+- **The connection it adds** (`.mcp.json`): one HTTP server, `apphandoff`, at
+  `https://api.apphandoff.com/mcp`, with no header, token or secret. Claude Code opens and
+  signs it in (`/mcp`); the hooks never read the sign-in. Its tools are the same ones the
+  connector or `claude mcp add` gives you.
 - **What `/pg` reads** (`find`, read-only, on your own AppHandoff connection and the project the
   chat's own calls used most recently; nothing is read before the chat has made an AppHandoff
   call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
@@ -157,7 +170,13 @@ release.
 - Titles beside `HO-<n>`, `MS-<n>` and `PG-<n>` (and the `get` reads behind them): set
   `APPHANDOFF_TICKET_TITLES=off` the same way; ids then draw as written and nothing is looked up.
   `APPHANDOFF_INBOX=off` stops them too. For one reply: put `no-hl-plz` in it.
-- Remove it: `/plugin uninstall apphandoff@apphandoff`, then start a new chat.
+- Remove it: `/plugin uninstall apphandoff@apphandoff`, then start a new chat. That removes the
+  connection the plugin added too; a `claude mcp add` entry of your own stays, and a claude.ai
+  connector is used again.
+
+## Privacy
+
+The connection the plugin adds is to AppHandoff. See the [privacy policy](https://apphandoff.com/privacy).
 
 ## License
 

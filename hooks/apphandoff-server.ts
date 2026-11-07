@@ -3,7 +3,9 @@
 // transcript row is. Pure: no `$`, no I/O.
 //
 // A tool arrives as `mcp__<server>__<tool>`. The host names the server one of
-// two ways: after the connector (`mcp__apphandoff__get`), or by an id (the
+// three ways: after the connection (`mcp__apphandoff__get`, a claude.ai connector
+// `mcp__claude_ai_AppHandoff__get`, or the one this plugin bundles in .mcp.json,
+// `mcp__plugin_apphandoff_apphandoff__get`), or by an id (the
 // Claude desktop app: `mcp__74eab0da-aeae-4938-857d-818f76b8f0bc__get`). The
 // ten tool names are generic words, so on their own they prove nothing:
 //   - a server named like AppHandoff is AppHandoff by its tool names alone;
@@ -38,6 +40,22 @@ export function parseToolName(name: string): { server: string; tool: string } | 
 /** Whether `mcp__<server>__<tool>` is an AppHandoff tool by name alone: one of the ten, on a server named like it. */
 export function isAppHandoffTool(server: string, tool: string): boolean {
   return APPHANDOFF_TOOLS.has(tool) && /apphandoff/i.test(server)
+}
+
+/** The server segment this plugin's own bundled connection (.mcp.json, key `apphandoff`) has in a tool name. */
+export const BUNDLED_SERVER_SEGMENT = 'plugin_apphandoff_apphandoff'
+/** The name /mcp lists that same connection under. */
+export const BUNDLED_SERVER_NAME = 'plugin:apphandoff:apphandoff'
+
+/**
+ * The name `$.mcp.call` takes for the server a tool name carries (`mcp__<server>__<tool>`). Only this plugin's
+ * bundled connection is mapped: `plugin_apphandoff_apphandoff` is called as `plugin:apphandoff:apphandoff`, the
+ * name /mcp lists. Every other spelling passes as is: a connection added by hand (`apphandoff`) and an id (the
+ * desktop app) are already the listed name, and the engine accepts a claude.ai connector's tool-name spelling
+ * (`claude_ai_AppHandoff`) as its own (engine types, `$.mcp.call`).
+ */
+export function callServerName(server: string): string {
+  return server === BUNDLED_SERVER_SEGMENT ? BUNDLED_SERVER_NAME : server
 }
 
 const SERVER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i

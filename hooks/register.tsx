@@ -30,6 +30,7 @@
 
 import { update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
+import { callServerName } from './apphandoff-server'
 import { isTimeout, withCallTimeout } from './call-timeout'
 import * as core from './inbox-core'
 import * as pv from './program-view'
@@ -57,7 +58,8 @@ type Answer = { ok: true; json: unknown } | { ok: false; text: string }
  * whole and spells each engine call plainly: the plugin directory reads `$` in no other shape (HO-22974).
  */
 function callTool($: EngineInterface, server: string, tool: Tool, args: Record<string, unknown>): Promise<McpToolResult> {
-  const call = $.mcp.call(server, tool, args)
+  // `server` is the tool-name spelling of the connection; `$.mcp.call` takes the name /mcp lists.
+  const call = $.mcp.call(callServerName(server), tool, args)
   return withCallTimeout((ms, fn) => $.clock.after(ms, fn), call)
 }
 
