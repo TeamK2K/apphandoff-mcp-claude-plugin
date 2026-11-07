@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "apphandoff": {
+      "type": "http",
+      "url": "https://api.apphandoff.com/mcp"
+    }
+  }
+}
