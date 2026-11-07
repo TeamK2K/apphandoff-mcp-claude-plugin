@@ -1141,7 +1141,8 @@ export const register: Register = (on) => {
 
   // The program view pane: a program picker, Refresh, and the drawing (./pg-client.tsx).
   on('ui.render', { component: 'Pane', requestId: PG_PANE }, async ($, e) => {
-    const { Box, Text, Button, Select, Client } = $.ui.resolve(e)
+    const { Box, Text, Button, Select } = $.ui.resolve(e)
+    const { Client } = $.ui.resolve(e)
     if (e.surface !== 'desktop' && e.surface !== 'terminal') {
       return <Text dimColor>The program view draws on the desktop app and terminal only.</Text>
     }
@@ -1159,6 +1160,25 @@ export const register: Register = (on) => {
     const meta = list.find((p) => p.ref === pg)
     const sums = ms ? pv.totals(ms) : null
     const split = ms ? pv.splitMilestones(ms) : null
+    // The drawing's props and key, built plainly here so the Client element below is a bare tag
+    // with one fixed module (the plugin directory reads it only in that shape).
+    const clientKey = 'pg-' + pg
+    const clientProps =
+      pg && ms && sums && split
+        ? {
+            ref: pg,
+            name: meta?.name ?? pg,
+            ...(meta?.headline ? { headline: meta.headline } : {}),
+            percent: sums.percent,
+            shipped: sums.shipped,
+            total: sums.total,
+            bar: pv.barWidths(sums.shipped, sums.active, sums.total),
+            inFlight: split.inFlight.map(pv.rowOf),
+            finished: split.finished.map(pv.rowOf),
+            updatedAt: v.readAt.get(pg) ?? 0,
+            refreshing: v.loading.has(pg),
+          }
+        : null
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -1182,25 +1202,7 @@ export const register: Register = (on) => {
         {v.programs !== null && !pg && <Text dimColor>No programs on this board.</Text>}
         {pg && ms === undefined && <Text dimColor>Loading {pg} milestones…</Text>}
         {pg && ms === null && <Text dimColor>Could not read {pg} from the board.</Text>}
-        {pg && ms && sums && split && (
-          <Client
-            key={`pg-${pg}`}
-            module="./pg-client.tsx"
-            props={{
-              ref: pg,
-              name: meta?.name ?? pg,
-              ...(meta?.headline ? { headline: meta.headline } : {}),
-              percent: sums.percent,
-              shipped: sums.shipped,
-              total: sums.total,
-              bar: pv.barWidths(sums.shipped, sums.active, sums.total),
-              inFlight: split.inFlight.map(pv.rowOf),
-              finished: split.finished.map(pv.rowOf),
-              updatedAt: v.readAt.get(pg) ?? 0,
-              refreshing: v.loading.has(pg),
-            }}
-          />
-        )}
+        {clientProps && <Client key={clientKey} module="./pg-client.tsx" props={clientProps} />}
       </Box>
     )
   })
