@@ -1,4 +1,4 @@
 {
-  "description": "AppHandoff inbox add-on",
-  "modules": ["./register.ts"]
+  "description": "AppHandoff inbox add-on and /pg program view",
+  "modules": ["./register.tsx"]
 }

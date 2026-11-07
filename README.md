@@ -6,7 +6,8 @@ this chat claimed or created, the chat gets a toast and is woken to read the thr
 reply (or, when a person posted, to ask you what to do through a board question). It also
 wakes the chat when a person decides a milestone move this chat asked for, accepts or drops
 a milestone this chat worked on, or answers a board question this chat asked. It also draws
-the title beside each `HO-<n>`, `MS-<n>` and `PG-<n>` in a reply.
+the title beside each `HO-<n>`, `MS-<n>` and `PG-<n>` in a reply, and `/pg` opens a pane with a
+program's progress and its milestones.
 
 Needs Claude Code 2.1.287 or later, your own Claude login, and the AppHandoff MCP
 connected in that chat.
@@ -73,6 +74,11 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   For that it reads the titles of the
   ids it has not seen with `get` calls on your own connection, up to 10 ids per call, which
   change nothing on your board. An id the board does not answer for stays as written.
+- `/pg [PG-n]` (it reads nothing until you run it) opens a pane with a program's progress and its
+  milestones, and a milestone's tickets when you press its number; a ticket opens on the portal.
+  It reads the board the chat's own AppHandoff calls used, with `find` reads that change nothing;
+  with no AppHandoff call in the chat yet (or with `APPHANDOFF_INBOX=off`), it says so and reads
+  nothing. While the pane is open it reads again every 60 s; close the pane and it stops.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
   pruned after 14 days; the ticket titles it read, keys named `ticket-title:HO-<n>`, `ticket-title:MS-<n>`, `ticket-title:PG-<n>`, kept
@@ -90,6 +96,19 @@ the instant wake of an idle Claude Code chat needs it.
   ids in a reply), `ticket` (a claim before a wake, a release when the chat ends) and, only with
   standby on, `question` (a list read before it asks you about a person's message). It never
   calls a tool of any other server and never fetches or runs code.
+- **What `/pg` reads** (`find`, read-only, on your own AppHandoff connection and the project the
+  chat's own calls used most recently; nothing is read before the chat has made an AppHandoff
+  call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
+  `/pg` runs, when the pane first draws and on Refresh; `find` of **milestone** (a program's
+  milestones), **proposal** (the approvals waiting on a person; read only when the chat's calls
+  named a project, and a board that refuses this read just draws the pane without approve flags)
+  and **ticket** (the open tickets of each milestone that is still moving, to count what is in
+  progress) when `/pg` runs, on Refresh, when you pick another program in the pane's Program
+  list (that program's milestones, proposals and open tickets), and every 60 s while the pane
+  is open; if a first read fails, it tries again every 60 s while the pane is open. It also
+  does `find` of **ticket** (all tickets of one milestone, archived ones included) when
+  you press a milestone number, and with each of those 60 s reads while that list is open. A
+  ticket you press opens its page on `https://portal.apphandoff.com`.
 - **What it sends, and where**: only to that AppHandoff connection: ticket, milestone and
   question ids, project ids and timestamps the chat's own AppHandoff calls already used, and
   `cc:<chat id>` as its agent id. Nothing goes to any other host.
@@ -109,7 +128,8 @@ the instant wake of an idle Claude Code chat needs it.
   unchanged. The chat-end hook releases the chat's claims and saves its state. The transcript
   hook changes nothing. The reply-drawing hook changes only how a reply is drawn on your
   screen (titles beside ids). `/inbox` shows the watch list, pauses or resumes wakes, and
-  turns standby on or off; it changes only the plugin's own state.
+  turns standby on or off; it changes only the plugin's own state. `/pg` opens a pane and
+  draws what the `find` reads above returned; it changes nothing on your board.
 
 ## Updates
 
@@ -123,6 +143,7 @@ release.
 
 - One chat: `/inbox pause` (wakes stop; `/inbox resume` restarts them).
 - Standby: `/inbox standby off` (it is off unless you turned it on).
+- The program view: close its pane (it reads only while open, and only after you run `/pg`).
 - Every new chat: set `APPHANDOFF_INBOX=off` in the `env` block of
   `~/.claude/settings.json`, then start a new chat; it loads idle.
 - Titles beside `HO-<n>`, `MS-<n>` and `PG-<n>` (and the `get` reads behind them): set

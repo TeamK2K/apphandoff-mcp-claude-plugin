@@ -1,5 +1,5 @@
 // Inbox add-on decision logic (HO-16353). Pure: no `$`, no I/O, no clock of
-// its own — register.ts feeds it what the engine said and does what it
+// its own — register.tsx feeds it what the engine said and does what it
 // returns, so every rule below is unit-tested under bun (inbox-core.spec.ts).
 
 // HO-19173: poll no faster than half COOLDOWN_MS; a faster poll cannot deliver a wake sooner.
