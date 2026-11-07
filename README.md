@@ -96,6 +96,14 @@ the instant wake of an idle Claude Code chat needs it.
   ids in a reply), `ticket` (a claim before a wake, a release when the chat ends) and, only with
   standby on, `question` (a list read before it asks you about a person's message). It never
   calls a tool of any other server and never fetches or runs code.
+- **When it calls them, without the model asking**: `message` and `get` on the poll timer while it
+  watches (see the cadence above), `get` for the ticket ids in a reply or tool result when it is
+  recorded, `ticket` before a wake, when the chat ends or you clear it, and from the next chat you
+  start on that computer (a release for a chat that ended), `question` only in standby. `/pg`
+  makes its `find` reads only after you run it. Nothing else is called on its own.
+- **What it fetches and runs**: it fetches nothing from the internet and runs no program, shell
+  command or downloaded code. Its code is the hooks files that ship in this plugin; every read
+  goes through your own AppHandoff connection in Claude Code.
 - **What `/pg` reads** (`find`, read-only, on your own AppHandoff connection and the project the
   chat's own calls used most recently; nothing is read before the chat has made an AppHandoff
   call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
