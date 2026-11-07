@@ -1,6 +1,6 @@
 // AppHandoff for Claude Code — a time limit for the plugin's board calls (HO-21343).
 //
-// Pure and used by ./register.ts: no `$.mcp.call` the plugin
+// Pure and used by ./register.tsx: no `$.mcp.call` the plugin
 // makes may wait for ever, or one call that never settles (a dropped connection)
 // leaves the inbox's `polling` flag set and every later poll returns at once. The
 // server answers its own 45 s TIMEOUT first when it can; this is the backstop, so

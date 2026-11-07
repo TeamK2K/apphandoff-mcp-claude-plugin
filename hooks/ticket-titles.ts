@@ -1,5 +1,5 @@
 // Ticket, milestone and program titles beside HO/MS/PG ids in a reply (HO-22951, HO-22968). Pure, no `$`: the wiring in
-// ./register.ts collects the ids, asks the board, caches the answers and hands the drawing
+// ./register.tsx collects the ids, asks the board, caches the answers and hands the drawing
 // a map; this file only decides what text a reply is drawn with.
 //
 // A reply that says `HO-20342` draws as `[HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`

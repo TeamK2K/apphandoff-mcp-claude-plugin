@@ -22,11 +22,17 @@
 // lives in ./inbox-core.ts (pure, unit-tested); this file only moves what the
 // engine says into it and acts on what it returns. Nothing here may throw
 // into the chat: every hook and timer path catches.
+//
+// The same module also holds `/pg` (HO-24860), the program view: a pane that reads a program's
+// milestones and tickets from the board this chat's own AppHandoff calls used (read-only `find`
+// calls, only while the pane is open; the numbers are ./program-view.ts's, the drawing is
+// ./pg-client.tsx). It is a .tsx file because the pane is drawn here.
 
 import { update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
 import { isTimeout, withCallTimeout } from './call-timeout'
 import * as core from './inbox-core'
+import * as pv from './program-view'
 import { statusWith } from './status-line'
 import * as titles from './ticket-titles'
 
@@ -77,7 +83,7 @@ async function readThread($: EngineInterface, server: string, args: Record<strin
   }
 }
 
-type Tool = 'message' | 'ticket' | 'question' | 'get'
+type Tool = 'message' | 'ticket' | 'question' | 'get' | 'find'
 
 /**
  * One board call: its JSON answer when `answers` takes it, else the failure text. A refusal
@@ -548,6 +554,7 @@ async function start($: EngineInterface, sessionId: string) {
   titlesOff = core.isOff(await $.env.get('APPHANDOFF_TICKET_TITLES'))
   titleHydration = null
   titleRetryAt = 0
+  resetProgramView()
   const now = await $.clock.now()
   const own = await $.store.get(core.STORE_PREFIX + sessionId)
   pendingCalls.clear()
@@ -762,8 +769,228 @@ function syncTitles($: EngineInterface, text?: string) {
   } catch {}
 }
 
+// ── program view, /pg (HO-24860) ─────────────────────────────────────────
+//
+// `/pg [PG-n]` opens the `pg-view` pane: one program's progress and its milestones, read from the board
+// the chat's own AppHandoff calls used (the connection the inbox learned, the project the chat's calls
+// named most recently; with no such call yet the pane says so and calls nothing). All reads are `find`
+// calls, which change nothing: the programs and the milestones with their pending approvals (and the
+// open tickets of each milestone still moving) when /pg runs or the pane first draws, on Refresh, and
+// every 60 s while the pane is open (its client module asks); a milestone's tickets when its number is
+// pressed (and with each refresh while that list is open). The numbers are ./program-view.ts's.
+
+const PG_PANE = 'pg-view'
+const MS_PANE = 'ms-view'
+const NO_CALL = 'Make an AppHandoff call in this chat first (for example, ask Claude to look up a ticket), then open /pg again. Nothing is read until then.'
+
+/** What one board's program view has read: the last good read of each part stays while a refresh runs. */
+type PgView = {
+  /** The board it was read from (connection and project); another board starts a new view. */
+  key: string
+  /** undefined: not read yet; null: the read failed. */
+  programs: pv.Pg[] | null | undefined
+  milestones: Map<string, pv.Ms[] | null>
+  readAt: Map<string, number>
+  /** The portal page of each milestone approval waiting on a person. */
+  approvals: Map<string, string>
+  tickets: Map<string, pv.Tk[] | null>
+  /** Reads running now ('*' for the programs, else a PG or MS number). */
+  loading: Set<string>
+  /** Reads started for this board ('load' for the first draw, else a PG number): a draw reads a part once. */
+  asked: Set<string>
+  /** Failed first reads waiting for their retry ('*' for the programs, else a PG number). */
+  retrying: Set<string>
+}
+
+/** Where a read goes: the connection and the project (null: the connection resolves it, as it did for the chat). */
+type Target = { server: string; project: string | null }
+
+const freshView = (key: string): PgView => ({
+  key,
+  programs: undefined,
+  milestones: new Map(),
+  readAt: new Map(),
+  approvals: new Map(),
+  tickets: new Map(),
+  loading: new Set(),
+  asked: new Set(),
+  retrying: new Set(),
+})
+
+/** The projects this chat's own AppHandoff calls used, most recent first. Memory only: a new chat starts empty. */
+let usedProjects: string[] = []
+/** Whether this chat has made an AppHandoff call since it started: a connection restored from the store is not enough. */
+let chatCalled = false
+let pgView: PgView = freshView('')
+/** The program the pane shows, and the milestone its ticket list shows. */
+let pgProgram: string | null = null
+let pgMilestone: string | null = null
+
+function resetProgramView() {
+  usedProjects = []
+  chatCalled = false
+  pgView = freshView('')
+  pgProgram = null
+  pgMilestone = null
+}
+
+/** The board /pg reads now. */
+const pgBoard = (): pv.BoardPick => pv.pickBoard(state?.servers ?? [], usedProjects, chatCalled, off)
+
+/** The view of a board; a different board (another project the chat moved to) drops what the last one read. */
+function viewOf(key: string): PgView {
+  if (pgView.key !== key) {
+    pgView = freshView(key)
+    pgMilestone = null
+  }
+  return pgView
+}
+
+/** Why there is nothing to read, in words. */
+function pgNothing(pick: pv.BoardPick): string {
+  if (pick.kind === 'ambiguous') return 'This chat has used more than one AppHandoff connection, so /pg cannot tell which board to read.'
+  return off ? 'The AppHandoff add-on is off (APPHANDOFF_INBOX=off), so /pg cannot tell which board this chat uses.' : NO_CALL
+}
+
+/** Every item of a `find`, page by page, up to `cap`. Throws when the board refuses or fails. */
+async function findAll($: EngineInterface, t: Target, args: Record<string, unknown>, cap = 500): Promise<unknown[]> {
+  const out: unknown[] = []
+  let cursor: string | undefined
+  do {
+    const ask = { ...(t.project ? { project_id: t.project } : {}), limit: 100, max_bytes: 16384, ...args, ...(cursor ? { cursor } : {}) }
+    const r = await boardCall($, t.server, 'find', ask, (j) => core.isRecord(j) && Array.isArray(j.items))
+    if (!r.ok) throw new Error(r.text)
+    if (!core.isRecord(r.json)) throw new Error('find returned no list')
+    if (Array.isArray(r.json.items)) out.push(...r.json.items)
+    cursor = typeof r.json.next_cursor === 'string' && r.json.next_cursor !== '' ? r.json.next_cursor : undefined
+  } while (cursor && out.length < cap)
+  return out
+}
+
+function some<T>(x: T | null): x is T {
+  return x !== null
+}
+
+/** Ask the pane to draw again; a refused or failed redraw is not worth an unhandled rejection. */
+async function redraw($: EngineInterface): Promise<void> {
+  try {
+    await $.ui.invalidate('ui.render')
+  } catch {}
+}
+
+/** Reads of one milestone's tickets run this many at a time. */
+const TICKET_READS_AT_ONCE = 4
+/** A failed first read is tried again after this long, while the pane is open (the drawing that would ask is not on screen). */
+const RETRY_MS = 60_000
+
+async function retryRead($: EngineInterface, v: PgView, key: string, again: () => Promise<void>): Promise<void> {
+  v.retrying.delete(key)
+  if (pgView === v && (await paneOpen($, PG_PANE))) await again()
+}
+
+function retryLater($: EngineInterface, v: PgView, key: string, again: () => Promise<void>) {
+  if (v.retrying.has(key)) return
+  v.retrying.add(key)
+  $.clock.after(RETRY_MS, () => void retryRead($, v, key, again))
+}
+
+async function fetchPrograms($: EngineInterface, t: Target, v: PgView): Promise<void> {
+  if (v.loading.has('*')) return
+  v.loading.add('*')
+  try {
+    v.programs = (await findAll($, t, { type: 'program' }, 300)).map(pv.programFrom).filter(some)
+  } catch {
+    v.programs = v.programs ?? null
+    if (v.programs === null) retryLater($, v, '*', () => loadProgram($, t, v))
+  } finally {
+    v.loading.delete('*')
+    await redraw($)
+  }
+}
+
 /**
- * The plugin's one hooks module (hooks.json names one per plugin): the inbox.
+ * One read of a program: its milestones, the pending approvals (a refused proposal read, OAuth-only,
+ * draws the pane without approve flags) and the open tickets of each milestone still moving (to count
+ * what is in progress and which wait on a decision). The last good read stays on screen while it runs.
+ */
+async function fetchMilestones($: EngineInterface, t: Target, v: PgView, pg: string): Promise<void> {
+  if (v.loading.has(pg)) return
+  v.asked.add(pg)
+  v.loading.add(pg)
+  await redraw($)
+  try {
+    const items = await findAll($, t, { type: 'milestone', filter: { program: pg } })
+    // Without a project the proposal read would list every project the sign-in can reach, and a bare
+    // MS-n would flag a milestone of another project: no project named, no approval flags.
+    const proposals = t.project ? await findAll($, t, { type: 'proposal' }, 100).catch(() => []) : []
+    const { pending, urls } = pv.proposalsFrom(proposals)
+    const read = await pv.mapLimit(items, TICKET_READS_AT_ONCE, async (item) => {
+      const ref = pv.ticketsToRead(item)
+      const open = ref ? (await findAll($, t, { type: 'ticket', filter: { milestone: ref, stage: pv.OPEN_STAGES } }, 200)).map(pv.ticketFrom).filter(some) : []
+      return pv.milestoneFrom(item, open, pending)
+    })
+    v.approvals = urls
+    v.milestones.set(pg, read.filter(some))
+    v.readAt.set(pg, await $.clock.now())
+  } catch {
+    if (!v.milestones.get(pg)) {
+      v.milestones.set(pg, null)
+      retryLater($, v, pg, () => fetchMilestones($, t, v, pg))
+    }
+  } finally {
+    v.loading.delete(pg)
+    await redraw($)
+  }
+}
+
+async function fetchTickets($: EngineInterface, t: Target, v: PgView, ms: string): Promise<void> {
+  if (v.loading.has(ms)) return
+  v.loading.add(ms)
+  try {
+    // Archived tickets are shipped work too: the list matches the shipped count in the header.
+    v.tickets.set(ms, (await findAll($, t, { type: 'ticket', filter: { milestone: ms, include_archived: true } })).map(pv.ticketFrom).filter(some))
+  } catch {
+    if (!v.tickets.get(ms)) v.tickets.set(ms, null)
+  } finally {
+    v.loading.delete(ms)
+    await redraw($)
+  }
+}
+
+/** The programs, then the milestones of the one shown (the one asked for, else the board's first). */
+async function loadProgram($: EngineInterface, t: Target, v: PgView): Promise<void> {
+  v.asked.add('load')
+  await fetchPrograms($, t, v)
+  const pg = pgProgram ?? v.programs?.[0]?.ref
+  if (pg) await fetchMilestones($, t, v, pg)
+}
+
+/** Whether one of this plugin's panes is open now: the engine's record. A failed look counts as closed. */
+async function paneOpen($: EngineInterface, id: string): Promise<boolean> {
+  try {
+    return (await $.ui.panes()).some((p) => p.id === id)
+  } catch {
+    return false
+  }
+}
+
+async function showProgram($: EngineInterface, pg: string | undefined): Promise<string> {
+  if (pg) pgProgram = pg
+  const pick = pgBoard()
+  if (pick.kind === 'ok') void loadProgram($, pick, viewOf(pick.key))
+  await $.ui.open({ id: PG_PANE, title: 'Program view' })
+  if (pick.kind !== 'ok') return pgNothing(pick)
+  return pg ? `Program view opened on ${pg}.` : 'Program view opened.'
+}
+
+async function showMilestone($: EngineInterface, t: Target, v: PgView, ms: string): Promise<void> {
+  pgMilestone = ms
+  void fetchTickets($, t, v, ms)
+  await $.ui.open({ id: MS_PANE, title: ms })
+}
+
+/**
+ * The plugin's one hooks module (hooks.json names one per plugin): the inbox, and the /pg program view.
  * It draws the status line through ./status-line.ts and decides which server
  * is AppHandoff in ./apphandoff-server.ts. Its ticket titles (HO-22951) are
  * drawn by the `ui.render` hook below from the cache above.
@@ -776,6 +1003,13 @@ export const register: Register = (on) => {
         name: 'inbox',
         description: 'AppHandoff inbox: what this chat watches; pause or resume wakes; standby makes this chat a standing inbox',
         argumentHint: '[pause|resume|standby <project ids>|standby off]',
+      })
+    } catch {}
+    try {
+      await $.command.register({
+        name: 'pg',
+        description: 'AppHandoff program view: progress and milestones of a program, read from the board this chat uses',
+        argumentHint: '[PG-n]',
       })
     } catch {}
     try {
@@ -844,6 +1078,11 @@ export const register: Register = (on) => {
       try {
         await learn($, seen, scope)
       } catch {}
+      // The project the chat's own call used, for /pg (a subagent's calls are not the chat's).
+      if (scope === 'chat' && state && pv.serverOfTool(seen.tool, state.servers)) {
+        chatCalled = true
+        usedProjects = pv.rememberProject(usedProjects, pv.projectOfCall(seen, state.servers))
+      }
     }
     // The reply's ticket ids, now that this row may have taught the connection (HO-22951). A subagent's text is not drawn here.
     if (e.agentId === undefined) syncTitles($, e.door === 'response' ? core.toolResultText(e.message.content) : undefined)
@@ -889,5 +1128,163 @@ export const register: Register = (on) => {
     } catch (err) {
       return { text: `inbox: ${err instanceof Error ? err.message : String(err)}` }
     }
+  })
+
+  // /pg [PG-n] opens the program view pane (HO-24860); the pane reads the board, this only opens it.
+  on('command.run', { command: 'pg' }, async ($, e) => {
+    try {
+      return { text: await showProgram($, e.args.match(/PG-\d+/i)?.[0]?.toUpperCase()) }
+    } catch (err) {
+      return { text: `pg: ${err instanceof Error ? err.message : String(err)}` }
+    }
+  })
+
+  // The program view pane: a program picker, Refresh, and the drawing (./pg-client.tsx).
+  on('ui.render', { component: 'Pane', requestId: PG_PANE }, async ($, e) => {
+    const { Box, Text, Button, Select, Client } = $.ui.resolve(e)
+    if (e.surface !== 'desktop' && e.surface !== 'terminal') {
+      return <Text dimColor>The program view draws on the desktop app and terminal only.</Text>
+    }
+    const pick = pgBoard()
+    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing(pick)}</Text>
+    const v = viewOf(pick.key)
+    // A pane drawn without /pg having run (it stayed up from an earlier chat) reads once.
+    if (!v.asked.has('load')) void loadProgram($, pick, v)
+    if (v.programs === undefined) return <Text dimColor>Loading programs…</Text>
+
+    const list = v.programs ?? []
+    const pg = list.find((p) => p.ref === pgProgram)?.ref ?? list[0]?.ref ?? null
+    if (pg && !v.asked.has(pg)) void fetchMilestones($, pick, v, pg)
+    const ms = pg ? v.milestones.get(pg) : undefined
+    const meta = list.find((p) => p.ref === pg)
+    const sums = ms ? pv.totals(ms) : null
+    const split = ms ? pv.splitMilestones(ms) : null
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="row" columnGap={1}>
+          {pg && (
+            <Select
+              key="pg-pick"
+              label="Program"
+              value={pg}
+              options={list.map((p) => ({ value: p.ref, label: `${p.ref} ${p.name}` }))}
+              onSelect={(chosen: string) => {
+                pgProgram = chosen
+                if (!pgView.milestones.has(chosen)) void fetchMilestones($, pick, v, chosen)
+                else void redraw($)
+              }}
+            />
+          )}
+          <Button key="pg-refresh" label="Refresh" onPress={() => void loadProgram($, pick, v)} />
+        </Box>
+        {v.programs === null && <Text dimColor>Could not read the programs from the board.</Text>}
+        {v.programs !== null && !pg && <Text dimColor>No programs on this board.</Text>}
+        {pg && ms === undefined && <Text dimColor>Loading {pg} milestones…</Text>}
+        {pg && ms === null && <Text dimColor>Could not read {pg} from the board.</Text>}
+        {pg && ms && sums && split && (
+          <Client
+            key={`pg-${pg}`}
+            module="./pg-client.tsx"
+            props={{
+              ref: pg,
+              name: meta?.name ?? pg,
+              ...(meta?.headline ? { headline: meta.headline } : {}),
+              percent: sums.percent,
+              shipped: sums.shipped,
+              total: sums.total,
+              bar: pv.barWidths(sums.shipped, sums.active, sums.total),
+              inFlight: split.inFlight.map(pv.rowOf),
+              finished: split.finished.map(pv.rowOf),
+              updatedAt: v.readAt.get(pg) ?? 0,
+              refreshing: v.loading.has(pg),
+            }}
+          />
+        )}
+      </Box>
+    )
+  })
+
+  // The program view asks for a re-read every minute (only while its pane is open), or for a milestone's tickets.
+  on('ui.message', async ($, e, next) => {
+    if (!e.module.endsWith('pg-client.tsx')) return next(e)
+    try {
+      const msg = pv.messageFrom(e.data)
+      const pick = pgBoard()
+      if (pick.kind === 'ok') {
+        const v = viewOf(pick.key)
+        if (msg.refresh && (await paneOpen($, PG_PANE))) {
+          void fetchMilestones($, pick, v, msg.refresh)
+          if (pgMilestone && (await paneOpen($, MS_PANE))) void fetchTickets($, pick, v, pgMilestone)
+        }
+        if (msg.open) await showMilestone($, pick, v, msg.open)
+      }
+    } catch {}
+    return {}
+  })
+
+  // A milestone's tickets, open ones first by stage, shipped ones dimmed; a ticket opens on the portal.
+  on('ui.render', { component: 'Pane', requestId: MS_PANE }, async ($, e) => {
+    const { Box, Text, Link } = $.ui.resolve(e)
+    const pick = pgBoard()
+    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing(pick)}</Text>
+    const v = viewOf(pick.key)
+    const ref = pgMilestone
+    if (!ref) return <Text dimColor>No milestone selected.</Text>
+    const tickets = v.tickets.get(ref)
+    const m = [...v.milestones.values()].flatMap((x) => x ?? []).find((x) => x.ref === ref)
+    const { open, shipped } = pv.splitTickets(tickets ?? [])
+    const stageColor: Record<string, string> = { in_progress: 'yellow', validation: 'yellow', up_next: 'cyan', backlog: 'gray' }
+
+    const item = (t: pv.Tk, quiet: boolean) => (
+      <Box key={`ms-row-${t.ref}`} flexDirection="row" columnGap={1}>
+        <Link key={`ms-open-${t.ref}`} href={pv.ticketUrl(t.ref) ?? pv.PORTAL} label={t.ref} />
+        <Box width={12} flexShrink={0}>
+          <Text color={quiet ? undefined : stageColor[t.stage]} dimColor={quiet}>
+            {t.stage.replace('_', ' ')}
+          </Text>
+        </Box>
+        <Box flexShrink={1}>
+          <Text wrap="truncate-end" dimColor={quiet}>
+            {t.type === 'decision_needed' && !quiet ? <Text color="magenta">⚑ </Text> : ''}
+            {t.title}
+          </Text>
+        </Box>
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column">
+          <Text bold>
+            {ref}
+            {m ? ` · ${m.title}` : ''}
+          </Text>
+          {m && (
+            <Text dimColor>
+              {m.status} · {m.shipped} of {m.total} shipped · {m.active} in progress
+            </Text>
+          )}
+        </Box>
+        <Box flexDirection="row" columnGap={2}>
+          {v.approvals.has(ref) && <Link href={v.approvals.get(ref) ?? pv.PORTAL} label="⚑ Review approval" />}
+          <Link href={`${pv.PORTAL}${ref}`} label="Open in portal" />
+        </Box>
+        {tickets === undefined && <Text dimColor>Loading tickets…</Text>}
+        {tickets === null && <Text dimColor>Could not read {ref} tickets.</Text>}
+        {tickets && (
+          <Box flexDirection="column">
+            <Text bold>Open · {open.length}</Text>
+            {open.length ? open.map((t) => item(t, false)) : <Text dimColor>Nothing open.</Text>}
+          </Box>
+        )}
+        {shipped.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Shipped · {shipped.length}</Text>
+            {shipped.map((t) => item(t, true))}
+          </Box>
+        )}
+      </Box>
+    )
   })
 }
