@@ -60,6 +60,8 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
 
 - While it watches a ticket or waits on an approval, or while standby is on, it polls your own
   AppHandoff connection every 60 s, slowing to 2 min after 5 quiet minutes and 5 min after 30;
+  with only watched tickets pending, the quiet clock restarts on a new watch, a new message from
+  someone else, or a message or reply this chat sends, not on its other AppHandoff calls;
   with nothing to watch it makes no calls. Standby polls with no ticket watched: it reads the
   notice list of the projects you named.
 - It injects a wake prompt into the chat when the board has something for it. A wake carries

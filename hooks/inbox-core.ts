@@ -88,7 +88,10 @@ export type InboxState = {
   paused: null | 'user' | 'limit'
   authFailures: number
   authStopped: boolean
+  /** The poll pace clock for a watch alone: a new watch, a fresh message, this chat's message send or reply (HO-25200). */
   lastActivityAt: number
+  /** The last successful AppHandoff call of the chat; paces the poll only while an approval, question, driven milestone or standby waits. */
+  lastCallAt: number
   lastPollAt: number | null
   lastError: string | null
   calls: number
@@ -145,6 +148,7 @@ export function initialState(sessionId: string, now: number): InboxState {
     authFailures: 0,
     authStopped: false,
     lastActivityAt: now,
+    lastCallAt: now,
     lastPollAt: null,
     lastError: null,
     calls: 0,
@@ -394,7 +398,16 @@ export function learnFromToolCall(state: InboxState, call: ToolCallSeen, now: nu
     authResumed = true
     changed = true
   }
-  next = { ...next, lastActivityAt: now }
+  // Any call is a sign of life (`lastCallAt`, paced on only while an approval, question, driven
+  // milestone or standby waits). Only this chat's own message send or reply expects an answer, so
+  // only it returns a watch-only poll to the fast pace (HO-25200): plain reads and writes do not.
+  const sent =
+    scope === 'chat' &&
+    name.tool === 'message' &&
+    call.args.dry_run !== true &&
+    isRecord(call.args.op) &&
+    (call.args.op.action === 'send' || call.args.op.action === 'reply')
+  next = { ...next, lastCallAt: now, ...(sent && { lastActivityAt: now }) }
 
   const text = call.text ?? ''
   const json = parseJson(text)
@@ -2573,7 +2586,10 @@ export function pollIntervalMs(state: InboxState, now: number): number {
   if (state.retryAt !== null && state.retryAt > now) return state.retryAt - now
   // A new watch baselines at once — unless the last call failed, then the normal pace.
   if (state.lastError === null && state.watched.some((w) => !w.baselined)) return 1_000
-  const quiet = now - state.lastActivityAt
+  // A watch alone steps back from the last reset; an approval, question, driven milestone or standby
+  // keeps the pace of any call by the chat, as before HO-25200.
+  const waits = hasApprovals(state) || hasDriven(state) || hasQuestions(state) || state.standby !== null
+  const quiet = now - (waits ? Math.max(state.lastActivityAt, state.lastCallAt) : state.lastActivityAt)
   if (quiet < ACTIVE_WINDOW_MS) return POLL_ACTIVE_MS
   if (quiet < QUIET_WINDOW_MS) return POLL_QUIET_MS
   return POLL_IDLE_MS
