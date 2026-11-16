@@ -748,6 +748,7 @@ let focusSession = ''
 async function startViews($: EngineInterface, sessionId: string) {
   try {
     focusSession = sessionId
+    focusWritten = null
     viewOpts = views.optionsFrom(await $.store.get(views.OPTIONS_KEY))
     await update($, VIEW_OPTIONS, () => ({ ...viewOpts }))
     // The views are off: nothing is kept for this chat, and an entry from a run with them on goes.
@@ -787,8 +788,22 @@ async function noteMentions($: EngineInterface, refs: string[]) {
     // A /clear that lands while this awaits makes the ids another chat's: they are then neither merged nor saved.
     const session = focusSession
     const next = await update($, FOCUS, (current) => (focusSession === session ? views.withMentions(current, refs) : (current ?? views.emptyFocus())))
-    if (focusSession === session) await saveFocus($, next?.recent ?? [])
+    // Not awaited: the append goes on while the entry is written (an unchanged one is not written at all).
+    if (focusSession === session) void saveFocus($, next?.recent ?? [])
   } catch {}
+}
+
+/** The entry last written to the store, so an unchanged one is skipped: the chat, its content without the time, and when. */
+let focusWritten: { session: string; key: string; at: number } | null = null
+/** A written entry is rewritten with a fresh time at most this often when nothing else changed (its time is what ages it out). */
+const FOCUS_REFRESH_MS = 60 * 60 * 1000
+
+/** Saves run one at a time, in call order: an older, slower write never lands after a newer one. */
+let focusSaving: Promise<void> = Promise.resolve()
+function saveFocus($: EngineInterface, recent?: readonly string[]): Promise<void> {
+  const run = focusSaving.then(() => writeFocus($, recent))
+  focusSaving = run.catch(() => {})
+  return run
 }
 
 /**
@@ -796,14 +811,18 @@ async function noteMentions($: EngineInterface, refs: string[]) {
  * Not with APPHANDOFF_TICKET_TITLES=off (the views are off, nothing is kept), and not when the chat changed
  * while it awaited: the write would put the old chat's ids under the new chat's key.
  */
-async function saveFocus($: EngineInterface, recent?: readonly string[]) {
+async function writeFocus($: EngineInterface, recent?: readonly string[]) {
   try {
     const session = focusSession
     if (!session || titlesOff) return
     const kept = recent ?? (await $.state.get(FOCUS)).value?.recent ?? []
     const now = await $.clock.now()
     if (focusSession !== session) return
-    await $.store.set(views.FOCUS_PREFIX + session, views.focusToStored(kept, now, { called: chatCalled, projects: usedProjects }))
+    const { savedAt, ...content } = views.focusToStored(kept, now, { called: chatCalled, projects: usedProjects })
+    const key = JSON.stringify(content)
+    if (focusWritten?.session === session && focusWritten.key === key && now - focusWritten.at < FOCUS_REFRESH_MS) return
+    await $.store.set(views.FOCUS_PREFIX + session, { ...content, savedAt })
+    focusWritten = { session, key, at: now }
   } catch {}
 }
 
@@ -885,6 +904,9 @@ function syncTitles($: EngineInterface, text?: string) {
   wantRefs($, text ? titles.refsIn(text) : [])
 }
 
+/** Whether the cache holds a card for `ref` that is young enough and that no write of this chat touched since. */
+const isKnownFresh = (ref: string, now: number): boolean => !titleStale.has(ref) && titles.isFresh(titles.fromStored(titleKnown.get(ref), now), now)
+
 /**
  * Asks the board (off the drawing path, one batch after another) for the `refs` no cache knows or whose card
  * is older than ten minutes, or that a write of this chat touched since. A drawing may call it: it returns
@@ -904,13 +926,19 @@ function wantRefs($: EngineInterface, refs: string[]) {
     void titleHydration
       .then(async () => {
         const now = await $.clock.now()
-        const fresh = { has: (ref: string) => !titleStale.has(ref) && titles.isFresh(titles.fromStored(titleKnown.get(ref), now), now) }
         // A stale ref is asked again even while an older read of it is out: that read may predate the write.
         const inFlight = { has: (ref: string) => titleAsking.has(ref) && !titleStale.has(ref) }
-        const ask = titles.unknownRefs([...new Set(refs)], fresh, inFlight)
+        const ask = titles.unknownRefs([...new Set(refs)], { has: (ref) => isKnownFresh(ref, now) }, inFlight)
         if (ask.length === 0) return
         for (const ref of ask) titleAsking.add(ref)
-        titleQueue = titleQueue.then(() => askTitles($, server, ask))
+        // A stale ref is not "in flight" until its job runs, so repeated draws queue it more than once: the job asks
+        // again what is still stale or old when its turn comes, and a ref an earlier job already read is not asked twice.
+        titleQueue = titleQueue.then(async () => {
+          const turn = await $.clock.now()
+          const due = ask.filter((ref) => !isKnownFresh(ref, turn))
+          for (const ref of ask) if (!due.includes(ref)) titleAsking.delete(ref)
+          if (due.length > 0) await askTitles($, server, due)
+        })
       })
       .catch(() => {})
   } catch {}
@@ -1262,7 +1290,7 @@ export const register: Register = (on) => {
         const firstOrMoved = !chatCalled || pv.projectOfCall(seen, state.servers) !== (usedProjects[0] ?? null)
         chatCalled = true
         usedProjects = pv.rememberProject(usedProjects, pv.projectOfCall(seen, state.servers))
-        if (firstOrMoved) await saveFocus($)
+        if (firstOrMoved) void saveFocus($)
       }
       // The ids the chat's own call names count as named (the band shows the latest program); a write that
       // landed marks them stale, so the next draw that wants them reads them again. Board reads wait for a draw.
@@ -1374,37 +1402,62 @@ export const register: Register = (on) => {
       if (command.action === 'invalid') return { text: views.HOVIEW_USAGE }
       if (command.action === 'mini') {
         if (command.open) {
+          // The option is on before the pane opens (its first draw reads it); an open the engine refuses puts it back.
+          const was = viewOpts.mini
           await setViewOption($, 'mini', true)
-          await openMini($)
+          try {
+            await openMini($)
+          } catch (err) {
+            await setViewOption($, 'mini', was)
+            throw err
+          }
           return { text: 'Mini program view opened.' }
         }
         await $.ui.close({ id: MINI_PANE })
         return { text: 'Mini program view closed.' }
       }
-      if (command.action === 'set') await setViewOption($, command.name, command.on === 'toggle' ? !viewOpts[command.name] : command.on)
+      if (command.action === 'set') {
+        const turnedOn = command.on === 'toggle' ? !viewOpts[command.name] : command.on
+        await setViewOption($, command.name, turnedOn)
+        // Off, the pane has nothing left to draw: it closes (a pane that is not open is no error).
+        if (command.name === 'mini' && !turnedOn) {
+          try {
+            await $.ui.close({ id: MINI_PANE })
+          } catch {}
+        }
+      }
       return { text: views.describeOptions(viewOpts) }
     } catch (err) {
       return { text: `hoview: ${err instanceof Error ? err.message : String(err)}` }
     }
   })
 
-  // The band above the composer (desktop, terminal; yields to a survey): `program` is one row with the latest
-  // program the chat touched (a press opens the /pg sidebar; ⧉ floats the mini view; an MS button opens that
-  // milestone's tickets), `shelf` is a second row with the chat's tickets, each a label whose card shows on hover.
-  // Only reads `$.state`; a card it lacks is asked off the drawing path (wantRefs).
+  // The band above the composer (desktop, terminal; yields to a survey): `program` is one row with one button, the
+  // latest program the chat touched (a press opens the /pg sidebar), `shelf` is a second row with the chat's
+  // tickets, each a label whose card shows on hover. The mini view is not in the band (/hoview mini open).
+  // Only reads `$.state`; a card it lacks is asked off the drawing path (wantRefs). A state read that fails
+  // draws what the engine draws, nothing added.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop') || titlesOff || off) return next(e)
-    const opts = views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value)
-    if (!opts.program && !opts.shelf) return next(e)
-    const infos = (await $.state.get(INFOS)).value
-    const focus = (await $.state.get(FOCUS)).value
-    const hovers = (await $.state.get(HOVERS)).value
-    const recent = focus?.recent ?? []
-    const goal = opts.program ? views.programFocus(recent, infos) : {}
-    const shelf = opts.shelf ? views.shelfRefs(focus?.watched ?? [], recent) : []
-    const pg = goal.pg
-    const ms = goal.ms
-    if (pg || ms || shelf.length > 0) wantRefs($, [...shelf, ...recent.slice(0, 6), ...(pg ? [pg] : []), ...(ms ? [ms] : [])])
+    let infos: views.Infos | undefined
+    let hovers: titles.Hovers | undefined
+    let shelf: string[] = []
+    let pg: string | undefined
+    try {
+      const opts = views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value)
+      if (!opts.program && !opts.shelf) return next(e)
+      infos = (await $.state.get(INFOS)).value
+      const focus = (await $.state.get(FOCUS)).value
+      hovers = (await $.state.get(HOVERS)).value
+      const recent = focus?.recent ?? []
+      const goal = opts.program ? views.programFocus(recent, infos) : {}
+      shelf = opts.shelf ? views.shelfRefs(focus?.watched ?? [], recent) : []
+      pg = goal.pg
+      const ms = goal.ms
+      if (pg || ms || shelf.length > 0) wantRefs($, [...shelf, ...recent.slice(0, 6), ...(pg ? [pg] : []), ...(ms ? [ms] : [])])
+    } catch {
+      return next(e)
+    }
     if (!pg && shelf.length === 0) return next(e)
     const { Box, Text, Button, Link } = $.ui.resolve(e)
     // What the engine or another plugin draws there stays: the band is added beside it.
@@ -1488,14 +1541,20 @@ export const register: Register = (on) => {
   // The mini program view: the latest program's name, one bar and done/total, small enough for a widget.
   on('ui.render', { component: 'Pane', requestId: MINI_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    if (titlesOff || off || !views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value).mini) {
-      return <Text dimColor>The mini program view is off (/hoview mini on).</Text>
+    let infos: views.Infos | undefined
+    let pg: string | undefined
+    try {
+      if (titlesOff || off || !views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value).mini) {
+        return <Text dimColor>The mini program view is off (/hoview mini on).</Text>
+      }
+      const focus = (await $.state.get(FOCUS)).value
+      infos = (await $.state.get(INFOS)).value
+      const goal = views.programFocus(focus?.recent ?? [], infos)
+      pg = goal.pg
+      wantRefs($, [...(pg ? [pg] : []), ...(goal.ms ? [goal.ms] : [])])
+    } catch {
+      return <Text dimColor>The mini program view could not be drawn.</Text>
     }
-    const focus = (await $.state.get(FOCUS)).value
-    const infos = (await $.state.get(INFOS)).value
-    const goal = views.programFocus(focus?.recent ?? [], infos)
-    const pg = goal.pg
-    wantRefs($, [...(pg ? [pg] : []), ...(goal.ms ? [goal.ms] : [])])
     if (!pg) return <Text dimColor>No program yet: name a milestone or program in the chat.</Text>
     const totals = views.programTotals(infos?.[pg])
     const bar = totals ? pv.barWidths(totals.done, totals.building, totals.total) : { shipped: 0, active: 0 }

@@ -9,7 +9,7 @@
 // or inside any URL is left as it was.
 
 import { PORTAL } from './apphandoff-server'
-import { type Info, parseInfo, REF_NUM } from './ticket-views'
+import { type Info, oneLine, parseInfo, REF_NUM } from './ticket-views'
 
 export { PORTAL }
 
@@ -65,7 +65,7 @@ const MAX_CHARS = 40
  */
 export function shortTitle(title: string): string {
   const cutAlready = /[…]\s*$/.test(title) || /\.\.\.\s*$/.test(title)
-  const words = title
+  const words = oneLine(title)
     .replace(/`/g, '') // dropped by escapeLinkText too; a title of backticks alone has no words
     .replace(/(…|\.\.\.)\s*$/, '')
     .split(/\s+/)
@@ -268,7 +268,9 @@ export function chipsFor(text: string, hovers: Hovers): Chip[] {
   for (const ref of refsIn(text)) {
     const card = hovers[ref]
     if (!card) continue
-    const lines = card.split('\n')
+    // Each line cleaned of control bytes (a card stored by an earlier version may hold some); a line break such a card
+    // already holds stays a line until the card is read again (HOVER_TTL_MS).
+    const lines = card.split('\n').map(oneLine)
     const second = lines.length > 2 ? (lines[1] ?? '') : ''
     const stand = NOT_STANDING.test(second) ? '' : second.split(' · ')[0]?.trim()
     out.push({ ref, label: stand ? `${ref} · ${stand}` : ref, lines })
@@ -325,13 +327,19 @@ const STAGE_WORDS: Record<string, string> = {
 }
 
 /** A board word (`up_next`, `in_progress`) as plain words. */
-const words = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? (STAGE_WORDS[v] ?? v.replace(/_/g, ' ')) : null)
+const words = (v: unknown): string | null => {
+  const s = typeof v === 'string' ? oneLine(v) : ''
+  return s !== '' ? (STAGE_WORDS[s] ?? s.replace(/_/g, ' ')) : null
+}
+
+/** A board string as one clean line, null when nothing is left. */
+const line = (v: unknown): string | null => (typeof v === 'string' && oneLine(v) !== '' ? oneLine(v) : null)
 
 /** One `MS-n name` / `PG-n name` line from a card's `milestone` or `program` field. */
 function parentLine(v: unknown): string | null {
   if (!isRecord(v)) return null
-  const ref = typeof v.ref === 'string' ? v.ref : null
-  const name = typeof v.name === 'string' ? v.name : typeof v.title === 'string' ? v.title : null
+  const ref = line(v.ref)
+  const name = line(v.name) ?? line(v.title)
   return ref || name ? [ref, name].filter(Boolean).join(' ') : null
 }
 
@@ -342,17 +350,18 @@ function parentLine(v: unknown): string | null {
  */
 export function hoverCard(item: unknown, asOf: string): string | null {
   if (!isRecord(item)) return null
-  const title = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : null
-  if (title === null || title.trim() === '') return null
-  const lines = [title.trim()]
+  // Every string of the card goes in as one clean line (a newline would forge a card line, an escape would garble the screen).
+  const title = line(item.title) ?? line(item.name)
+  if (title === null) return null
+  const lines = [title]
   const kind = typeof item.kind === 'string' ? item.kind : typeof item.ref === 'string' && item.ref.startsWith('HO-') ? 'ticket' : null
   if (kind === 'ticket') {
     const stand = [words(item.stage), words(item.status)].filter(Boolean).join(' · ')
-    const sized = [typeof item.priority === 'string' ? `${item.priority} priority` : null, typeof item.size === 'string' ? `size ${item.size}` : null]
-      .filter(Boolean)
-      .join(', ')
+    const priority = line(item.priority)
+    const size = line(item.size)
+    const sized = [priority ? `${priority} priority` : null, size ? `size ${size}` : null].filter(Boolean).join(', ')
     if (stand || sized) lines.push([stand, sized].filter(Boolean).join(' · '))
-    const claims = Array.isArray(item.claims) ? item.claims.filter((c): c is string => typeof c === 'string' && c !== '') : []
+    const claims = Array.isArray(item.claims) ? item.claims.flatMap((c) => line(c) ?? []) : []
     if (claims.length > 0) lines.push(`Claimed by ${claims.join(', ')}`)
     else if (item.stage !== 'live' && item.status !== 'closed') lines.push('Not claimed')
     const ms = parentLine(item.milestone)

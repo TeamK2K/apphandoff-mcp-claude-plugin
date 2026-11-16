@@ -1,4 +1,4 @@
-// Ticket views (local POC): what the plugin draws from the cards it has read, beyond a reply's link text.
+// Ticket views: what the plugin draws from the cards it has read, beyond a reply's link text.
 // Pure, no `$`: ./register.tsx collects the ids, asks the board, keeps the answers in `$.state` and draws;
 // this file decides the options, the structured record of a card, and every line of text the views show.
 //
@@ -22,7 +22,7 @@ export type Options = Record<OptionName, boolean>
 const NOTES: Record<OptionName, string> = {
   program: 'band above the composer: the latest program and its progress',
   shelf: 'band above the composer: your tickets, with a card on hover',
-  mini: 'floating mini program view (⧉ in the band, or /hoview mini open)',
+  mini: 'floating mini program view (/hoview mini open)',
   hint: 'line under the composer: the ticket you hold, else the latest mentioned',
   toolrow: 'a dim line under each AppHandoff tool call: the ticket it names',
   stage: 'stage after the title in a reply\'s ticket links',
@@ -40,7 +40,22 @@ const REF_TICKET = new RegExp(`^HO-${REF_NUM}$`)
 const REF_TICKET_ANYCASE = new RegExp(REF_TICKET.source, 'i')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined)
+/**
+ * A board string as one plain line: control characters (an escape, a C1 byte, a newline, a tab) become spaces,
+ * runs of whitespace fold, the ends are trimmed. Every title, claim, status and parent name goes through this
+ * before a view draws it, so a card cannot garble the terminal or forge a line of a hover card.
+ */
+export const oneLine = (s: string): string =>
+  s
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '') // zero-width and bidi controls: they hide or reorder text
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const str = (v: unknown): string | undefined => (typeof v === 'string' && oneLine(v) !== '' ? oneLine(v) : undefined)
+
+/** The claims of a card as clean lines, none empty. */
+const claimsOf = (v: unknown): string[] => (Array.isArray(v) ? v.flatMap((c) => (typeof c === 'string' && oneLine(c) !== '' ? [oneLine(c)] : [])) : [])
 
 /** The stored (or drawn) options over the defaults: only a boolean for a known name counts. */
 export function optionsFrom(raw: unknown): Options {
@@ -140,7 +155,7 @@ export function infoFrom(item: unknown, now: number): Info | null {
   set('state', item.state)
   set('priority', item.priority)
   set('size', item.size)
-  const claims = Array.isArray(item.claims) ? item.claims.filter((c): c is string => typeof c === 'string' && c !== '') : []
+  const claims = claimsOf(item.claims)
   if (claims.length > 0) info.claims = claims
   const milestone = parentOf(item.milestone)
   if (milestone) info.milestone = milestone
@@ -175,10 +190,8 @@ export function parseInfo(raw: unknown): Info | null {
     const s = str(raw[k])
     if (s) info[k] = s
   }
-  if (Array.isArray(raw.claims)) {
-    const claims = raw.claims.filter((c): c is string => typeof c === 'string' && c !== '')
-    if (claims.length > 0) info.claims = claims
-  }
+  const claims = claimsOf(raw.claims)
+  if (claims.length > 0) info.claims = claims
   const milestone = parentOf(raw.milestone)
   if (milestone) info.milestone = milestone
   const program = parentOf(raw.program)
@@ -319,7 +332,7 @@ export function programTotals(info: Info | undefined): { done: number; building:
   return { done: (info.counts.closed ?? 0) + (info.counts.done ?? 0), building: info.counts.building ?? 0, total }
 }
 
-/** `PG-120 · 27/34 done` (just the id until the program's card is read). Ralph 2026-11-16: no name, no MS, no tickets in the band. */
+/** `PG-120 · 27/34 done` (just the id until the program's card is read): no name, no milestone, no tickets in the band. */
 export function programLabel(ref: string, info: Info | undefined): string {
   const t = programTotals(info)
   return t ? `${ref} · ${t.done}/${t.total} done` : ref
@@ -402,5 +415,5 @@ export function toolLines(refs: readonly string[], infos: Infos | undefined): st
   return refs.length > TOOL_LINES && lines.length > 0 ? [...lines, `+${refs.length - TOOL_LINES} more`] : lines
 }
 
-/** The card lines a shelf entry reveals on hover: the stored hover card's lines, else the label. */
-export const cardLines = (card: string | undefined, fallback: string): string[] => (card ? card.split('\n') : [fallback])
+/** The card lines a shelf entry reveals on hover: the stored hover card's lines (each cleaned, a stored card may predate that), else the label. */
+export const cardLines = (card: string | undefined, fallback: string): string[] => (card ? card.split('\n').map(oneLine) : [fallback])
