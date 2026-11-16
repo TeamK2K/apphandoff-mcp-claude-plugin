@@ -66,7 +66,14 @@ export const isIdNamedServer = (server: string): boolean => SERVER_ID.test(serve
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const text = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v : null)
 
-const PORTAL_ORIGIN = 'https://portal.apphandoff.com/'
+/** The portal origin, trailing slash included: the one place the plugin names it (inbox-core, ticket-titles and program-view take it from here). */
+export const PORTAL = 'https://portal.apphandoff.com/'
+
+/** A link worth drawing: on the portal origin, at most 300 characters, no whitespace or control characters. Null for anything else. */
+export function portalUrlOf(v: unknown): string | null {
+  return typeof v === 'string' && v.length <= 300 && v.startsWith(PORTAL) && !/[\s\u0000-\u001f\u007f-\u009f]/.test(v) ? v : null
+}
+
 /** A write rule id: `ticket.`, `plan.`, `message.` or `project.` then the rule. */
 const RULE_ID = /^(?:ticket|plan|message|project)\./
 
@@ -94,7 +101,7 @@ export function answerNamesAppHandoff(answer: string | undefined): boolean {
   for (const h of holders) {
     const rule = text(h.rule_id)
     if (rule && RULE_ID.test(rule)) return true
-    for (const url of [text(h.url), text(h.portal_url)]) if (url?.startsWith(PORTAL_ORIGIN)) return true
+    for (const url of [text(h.url), text(h.portal_url)]) if (url?.startsWith(PORTAL)) return true
   }
   return false
 }

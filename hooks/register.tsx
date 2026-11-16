@@ -27,15 +27,23 @@
 // milestones and tickets from the board this chat's own AppHandoff calls used (read-only `find`
 // calls, only while the pane is open; the numbers are ./program-view.ts's, the drawing is
 // ./pg-client.tsx). It is a .tsx file because the pane is drawn here.
+//
+// And the ticket views (HO-22951, HO-22968; ./ticket-titles.ts, ./ticket-views.ts): titles and stages beside
+// the HO/MS/PG ids of a reply, and `/hoview` to switch each view: a band above the composer (a program button
+// that opens the /pg sidebar, a shelf of the chat's tickets), the hint line under it, one line under an
+// AppHandoff tool call, hover chips under a reply, a floating mini program view. They read the board with `get`
+// (read-only). The store keeps `ticket-title:<ref>`, `ticket-focus:<chat id>` and `hoview-options`; a reload or a
+// resume of the same chat gets back the ids it named and the board its own calls used.
 
 import { update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
-import { callServerName } from './apphandoff-server'
+import { callServerName, parseToolName } from './apphandoff-server'
 import { isTimeout, withCallTimeout } from './call-timeout'
 import * as core from './inbox-core'
 import * as pv from './program-view'
 import { statusWith } from './status-line'
 import * as titles from './ticket-titles'
+import * as views from './ticket-views'
 
 let state: core.InboxState | null = null
 let timer: { cancel: () => void } | null = null
@@ -232,6 +240,7 @@ async function learn($: EngineInterface, seen: core.ToolCallSeen, scope: core.Ro
     await save($)
     schedule($, 1_000)
   }
+  await syncFocus($)
 }
 
 function show($: EngineInterface) {
@@ -540,6 +549,7 @@ async function tick($: EngineInterface) {
     try {
       show($)
       await save($)
+      await syncFocus($)
       if (state) schedule($, core.pollIntervalMs(state, now || (await $.clock.now())))
       if (startAfterTick) {
         const sessionId = startAfterTick
@@ -556,13 +566,17 @@ async function start($: EngineInterface, sessionId: string) {
   titlesOff = core.isOff(await $.env.get('APPHANDOFF_TICKET_TITLES'))
   titleHydration = null
   titleRetryAt = 0
+  titleStale.clear()
+  focusKey = ''
   resetProgramView()
+  await startViews($, sessionId)
   const now = await $.clock.now()
   const own = await $.store.get(core.STORE_PREFIX + sessionId)
   pendingCalls.clear()
   state = core.fromStored(sessionId, core.expired(own, now) ? undefined : own, now)
   // A resumed chat already knows its connection: the cached titles reach the drawing now.
   syncTitles($)
+  await syncFocus($)
   const startNo = ++sweepStart
   sweepTimer?.cancel()
   sweepTimer = null
@@ -662,8 +676,24 @@ async function releaseHeld($: EngineInterface, ending: core.InboxState): Promise
 
 /** The drawing's titles: `$.state` (`types/index.d.ts`), the one value the drawing reads. */
 const TITLES = { plugin: 'apphandoff', key: 'ticketTitles' } as const
+/** Each id's hover card (full title, stage, status, claim), drawn as its link's tooltip; same lifecycle as `TITLES`. */
+const HOVERS = { plugin: 'apphandoff', key: 'ticketHovers' } as const
+/** Each id's card as data (kind, stage, status, claims, parents, a program's counts): what the ticket views draw from. Same lifecycle as `TITLES`. */
+const INFOS = { plugin: 'apphandoff', key: 'ticketInfo' } as const
+/** What this chat touched: the ids it named, its watched tickets and held leases. Memory of this chat, not cached. */
+const FOCUS = { plugin: 'apphandoff', key: 'ticketFocus' } as const
+/** Which ticket views are on (`/hoview`); kept in `$.store` under `views.OPTIONS_KEY`. */
+const VIEW_OPTIONS = { plugin: 'apphandoff', key: 'hoviewOptions' } as const
+/** Surfaces with a pointer, where a hover chip can reveal its card. */
+const HOVER_SURFACES = new Set(['desktop', 'vscode'])
 
 let titlesOff = false
+/** The options as the command last set them (the drawing reads them from `$.state`). */
+let viewOpts: views.Options = views.defaultOptions()
+/** Refs a write of this chat touched since they were read: asked again by the next draw that wants them. */
+const titleStale = new Set<string>()
+/** What `syncFocus` last handed to the drawing, to skip an unchanged one. */
+let focusKey = ''
 /** What this process knows by ref, with the time it was learned: the shortened title, or null for a ref the board did not answer (negative cache). The TTLs apply on read. */
 const titleKnown = new Map<string, titles.StoredTitle>()
 /** Refs queued or being asked, so a reply that repeats an id asks once. */
@@ -682,7 +712,14 @@ const titleServer = () => (titlesOff || off || !state ? null : core.activeServer
 async function hydrateTitles($: EngineInterface) {
   const now = await $.clock.now()
   const found: titles.Titles = {}
+  const cards: titles.Hovers = {}
+  const infos: views.Infos = {}
   for (const key of await $.store.keys()) {
+    // A chat's named ids (ticket-focus:<chat id>) past their 14 days go with the same sweep.
+    if (key.startsWith(views.FOCUS_PREFIX)) {
+      if (!views.focusFromStored(await $.store.get(key), now)) await $.store.delete(key)
+      continue
+    }
     if (!key.startsWith(titles.STORE_PREFIX)) continue
     const entry = titles.fromStored(await $.store.get(key), now)
     if (!entry) {
@@ -692,8 +729,82 @@ async function hydrateTitles($: EngineInterface) {
     const ref = key.slice(titles.STORE_PREFIX.length)
     titleKnown.set(ref, entry)
     if (entry.title) found[ref] = entry.title
+    if (entry.hover) cards[ref] = entry.hover
+    if (entry.info) infos[ref] = entry.info
   }
   if (Object.keys(found).length > 0) await update($, TITLES, (current) => titles.mergeTitles(current, found))
+  if (Object.keys(cards).length > 0) await update($, HOVERS, (current) => titles.mergeTitles(current, cards))
+  if (Object.keys(infos).length > 0) await update($, INFOS, (current) => titles.mergeTitles(current, infos))
+}
+
+/** The chat whose named ids are kept under `ticket-focus:<chat id>`. */
+let focusSession = ''
+
+/**
+ * A chat's views at its start: the options the store kept (defaults for none), and the ids this chat
+ * already named, from the store (so a plugin reload, a resumed chat or a reopened window keeps the band);
+ * a new chat starts with none. Entries of chats untouched for 14 days are swept with the title cache. Never throws.
+ */
+async function startViews($: EngineInterface, sessionId: string) {
+  try {
+    focusSession = sessionId
+    viewOpts = views.optionsFrom(await $.store.get(views.OPTIONS_KEY))
+    await update($, VIEW_OPTIONS, () => ({ ...viewOpts }))
+    // The views are off: nothing is kept for this chat, and an entry from a run with them on goes.
+    if (titlesOff) {
+      await $.store.delete(views.FOCUS_PREFIX + sessionId)
+      return
+    }
+    const raw = await $.store.get(views.FOCUS_PREFIX + sessionId)
+    const now = await $.clock.now()
+    const recent = views.focusFromStored(raw, now) ?? []
+    await update($, FOCUS, () => ({ ...views.emptyFocus(), recent }))
+    // The board this chat's own calls used before the reload: /pg and the band's program button read it again.
+    const board = views.boardFromStored(raw, now)
+    if (board) {
+      chatCalled = true
+      usedProjects = board.projects
+    }
+  } catch {}
+}
+
+/** Hands the inbox's watched tickets and held leases to the drawing, when they changed. Never throws. */
+async function syncFocus($: EngineInterface) {
+  try {
+    if (!state) return
+    const { watched, held } = views.watchedRefs(state.watched)
+    const key = JSON.stringify([watched, held])
+    if (key === focusKey) return
+    focusKey = key
+    await update($, FOCUS, (current) => views.withWatched(current, watched, held))
+  } catch {}
+}
+
+/** The ids a reply or an AppHandoff call named, as the latest the views show. Never throws. */
+async function noteMentions($: EngineInterface, refs: string[]) {
+  if (refs.length === 0 || titlesOff) return
+  try {
+    // A /clear that lands while this awaits makes the ids another chat's: they are then neither merged nor saved.
+    const session = focusSession
+    const next = await update($, FOCUS, (current) => (focusSession === session ? views.withMentions(current, refs) : (current ?? views.emptyFocus())))
+    if (focusSession === session) await saveFocus($, next?.recent ?? [])
+  } catch {}
+}
+
+/**
+ * Keeps this chat's named ids and the board its own calls used, so a reload restores both. Never throws.
+ * Not with APPHANDOFF_TICKET_TITLES=off (the views are off, nothing is kept), and not when the chat changed
+ * while it awaited: the write would put the old chat's ids under the new chat's key.
+ */
+async function saveFocus($: EngineInterface, recent?: readonly string[]) {
+  try {
+    const session = focusSession
+    if (!session || titlesOff) return
+    const kept = recent ?? (await $.state.get(FOCUS)).value?.recent ?? []
+    const now = await $.clock.now()
+    if (focusSession !== session) return
+    await $.store.set(views.FOCUS_PREFIX + session, views.focusToStored(kept, now, { called: chatCalled, projects: usedProjects }))
+  } catch {}
 }
 
 /**
@@ -701,45 +812,69 @@ async function hydrateTitles($: EngineInterface) {
  * answered without one. A batch the board fails whole as not found is asked ref by ref (one gone
  * ref must not hide the others); any other failure holds lookups for a while and answers nothing.
  */
-async function askBatch($: EngineInterface, server: string, batch: string[]): Promise<Record<string, string | null>> {
+type Answered = { titles: Record<string, string | null>; hovers: titles.Hovers; infos: views.Infos }
+
+async function askBatch($: EngineInterface, server: string, batch: string[]): Promise<Answered> {
   const r = await boardCall($, server, 'get', titles.lookupArgs(batch), titles.isGetAnswer)
-  if (r.ok) return titles.readAnswer(r.json, batch) ?? {}
+  if (r.ok) {
+    const at = await $.clock.now()
+    return { titles: titles.readAnswer(r.json, batch) ?? {}, hovers: titles.readHovers(r.json, batch, titles.clockText(at)), infos: views.readInfos(r.json, batch, at) }
+  }
   if (titles.isGone(r.text)) {
-    if (batch.length === 1) return { [batch[0] as string]: null }
-    const out: Record<string, string | null> = {}
+    if (batch.length === 1) return { titles: { [batch[0] as string]: null }, hovers: {}, infos: {} }
+    const out: Answered = { titles: {}, hovers: {}, infos: {} }
     for (const ref of batch) {
       const before = titleRetryAt
-      Object.assign(out, await askBatch($, server, [ref]))
+      const one = await askBatch($, server, [ref])
+      Object.assign(out.titles, one.titles)
+      Object.assign(out.hovers, one.hovers)
+      Object.assign(out.infos, one.infos)
       // Another kind of failure holds lookups: the rest of the batch waits too.
       if (titleRetryAt !== before) break
     }
     return out
   }
   titleRetryAt = (await $.clock.now()) + (core.retryAfterMs(r.text) ?? titles.RETRY_MS)
-  return {}
+  return { titles: {}, hovers: {}, infos: {} }
 }
 
 /** Asks the board for `ask` in batches, caches each answer, then hands the new titles to the drawing. Never throws. */
 async function askTitles($: EngineInterface, server: string, ask: string[]) {
+  const answeredInfos: views.Infos = {}
   try {
     for (const batch of titles.batches(ask)) {
       if (titleServer() !== server || (await $.clock.now()) < titleRetryAt) return
+      // Asked now: a write that lands from here on marks the ref stale again.
+      for (const ref of batch) titleStale.delete(ref)
       const answered = await askBatch($, server, batch)
       const now = await $.clock.now()
       const found: titles.Titles = {}
-      for (const [ref, title] of Object.entries(answered)) {
-        titleKnown.set(ref, titles.toStored(title, now))
+      const cards: titles.Hovers = {}
+      const infos: views.Infos = {}
+      for (const [ref, title] of Object.entries(answered.titles)) {
+        const hover = title ? answered.hovers[ref] : undefined
+        const info = title ? answered.infos[ref] : undefined
+        titleKnown.set(ref, titles.toStored(title, now, hover, info))
         try {
-          await $.store.set(titles.STORE_PREFIX + ref, titles.toStored(title, now))
+          await $.store.set(titles.STORE_PREFIX + ref, titles.toStored(title, now, hover, info))
         } catch {}
         if (title) found[ref] = title
+        if (hover) cards[ref] = hover
+        if (info) infos[ref] = info
       }
       if (Object.keys(found).length > 0) await update($, TITLES, (current) => titles.mergeTitles(current, found))
+      if (Object.keys(cards).length > 0) await update($, HOVERS, (current) => titles.mergeTitles(current, cards))
+      if (Object.keys(infos).length > 0) {
+        await update($, INFOS, (current) => titles.mergeTitles(current, infos))
+        Object.assign(answeredInfos, infos)
+      }
     }
   } catch {
   } finally {
     for (const ref of ask) titleAsking.delete(ref)
   }
+  // The milestone a ticket sits under, the program a milestone sits under: read too, for the band and the mini view.
+  if (viewOpts.program || viewOpts.mini) wantRefs($, views.impliedRefs(ask, answeredInfos))
 }
 
 /**
@@ -747,6 +882,15 @@ async function askTitles($: EngineInterface, server: string, ask: string[]) {
  * looks up the ids in `text` (an assistant reply) that no cache knows. Fire and forget; never throws.
  */
 function syncTitles($: EngineInterface, text?: string) {
+  wantRefs($, text ? titles.refsIn(text) : [])
+}
+
+/**
+ * Asks the board (off the drawing path, one batch after another) for the `refs` no cache knows or whose card
+ * is older than ten minutes, or that a write of this chat touched since. A drawing may call it: it returns
+ * at once and writes nothing itself. Fire and forget; never throws.
+ */
+function wantRefs($: EngineInterface, refs: string[]) {
   try {
     const server = titleServer()
     if (!server) return
@@ -754,15 +898,16 @@ function syncTitles($: EngineInterface, text?: string) {
     titleHydration ??= hydrateTitles($).catch(() => {
       titleHydration = null
     })
-    const refs = text ? titles.refsIn(text) : []
     if (refs.length === 0) return
     // The `$` of this hook is used after it returns, as the inbox's timers (`schedule` from `learn`) and
     // `submitWake` already do, and as the reference's own `session.start` example does for a loop that runs on.
     void titleHydration
       .then(async () => {
         const now = await $.clock.now()
-        const fresh = { has: (ref: string) => titles.fromStored(titleKnown.get(ref), now) !== null }
-        const ask = titles.unknownRefs(refs, fresh, titleAsking)
+        const fresh = { has: (ref: string) => !titleStale.has(ref) && titles.isFresh(titles.fromStored(titleKnown.get(ref), now), now) }
+        // A stale ref is asked again even while an older read of it is out: that read may predate the write.
+        const inFlight = { has: (ref: string) => titleAsking.has(ref) && !titleStale.has(ref) }
+        const ask = titles.unknownRefs([...new Set(refs)], fresh, inFlight)
         if (ask.length === 0) return
         for (const ref of ask) titleAsking.add(ref)
         titleQueue = titleQueue.then(() => askTitles($, server, ask))
@@ -819,9 +964,15 @@ const freshView = (key: string): PgView => ({
   retrying: new Set(),
 })
 
-/** The projects this chat's own AppHandoff calls used, most recent first. Memory only: a new chat starts empty. */
+/**
+ * The projects this chat's own AppHandoff calls used, most recent first. A new chat starts empty; the same chat after
+ * a reload or a resume gets them back from its `ticket-focus:<id>` entry (startViews; not with the views off).
+ */
 let usedProjects: string[] = []
-/** Whether this chat has made an AppHandoff call since it started: a connection restored from the store is not enough. */
+/**
+ * Whether this chat has made an AppHandoff call, in this run or (restored with `usedProjects` the same way) an
+ * earlier one of the same chat: a connection learned from the store alone is not enough.
+ */
 let chatCalled = false
 let pgView: PgView = freshView('')
 /** The program the pane shows, and the milestone its ticket list shows. */
@@ -976,10 +1127,13 @@ async function paneOpen($: EngineInterface, id: string): Promise<boolean> {
   }
 }
 
-async function showProgram($: EngineInterface, pg: string | undefined): Promise<string> {
+async function showProgram($: EngineInterface, pg: string | undefined, raise = false): Promise<string> {
   if (pg) pgProgram = pg
   const pick = pgBoard()
   if (pick.kind === 'ok') void loadProgram($, pick, viewOf(pick.key))
+  // Opening a pane that is already open only retitles it, and a press in the band refuses `focus`, so a
+  // press from the band closes the pane first: the fresh open is the one the surface shows.
+  if (raise && (await paneOpen($, PG_PANE))) await $.ui.close({ id: PG_PANE }).catch(() => undefined)
   await $.ui.open({ id: PG_PANE, title: 'Program view' })
   if (pick.kind !== 'ok') return pgNothing(pick)
   return pg ? `Program view opened on ${pg}.` : 'Program view opened.'
@@ -989,6 +1143,22 @@ async function showMilestone($: EngineInterface, t: Target, v: PgView, ms: strin
   pgMilestone = ms
   void fetchTickets($, t, v, ms)
   await $.ui.open({ id: MS_PANE, title: ms })
+}
+
+const MINI_PANE = 'pg-mini'
+
+/** Turns one ticket view on or off, for this chat's drawing and for the next chats. */
+async function setViewOption($: EngineInterface, name: views.OptionName, on: boolean): Promise<void> {
+  viewOpts = { ...viewOpts, [name]: on }
+  try {
+    await $.store.set(views.OPTIONS_KEY, viewOpts)
+  } catch {}
+  await update($, VIEW_OPTIONS, () => ({ ...viewOpts }))
+}
+
+/** The floating mini program view: a widget where the surface has them, else the same compact view in a pane. */
+async function openMini($: EngineInterface): Promise<void> {
+  await $.ui.open({ id: MINI_PANE, title: 'Program', placement: 'widget' })
 }
 
 /**
@@ -1012,6 +1182,13 @@ export const register: Register = (on) => {
         name: 'pg',
         description: 'AppHandoff program view: progress and milestones of a program, read from the board this chat uses',
         argumentHint: '[PG-n]',
+      })
+    } catch {}
+    try {
+      await $.command.register({
+        name: 'hoview',
+        description: 'AppHandoff ticket views: list them, or turn one on or off (program, shelf, mini, hint, toolrow, stage, chips)',
+        argumentHint: '[<name|number> [on|off]] | mini open|close',
       })
     } catch {}
     try {
@@ -1082,28 +1259,76 @@ export const register: Register = (on) => {
       } catch {}
       // The project the chat's own call used, for /pg (a subagent's calls are not the chat's).
       if (scope === 'chat' && state && pv.serverOfTool(seen.tool, state.servers)) {
+        const firstOrMoved = !chatCalled || pv.projectOfCall(seen, state.servers) !== (usedProjects[0] ?? null)
         chatCalled = true
         usedProjects = pv.rememberProject(usedProjects, pv.projectOfCall(seen, state.servers))
+        if (firstOrMoved) await saveFocus($)
+      }
+      // The ids the chat's own call names count as named (the band shows the latest program); a write that
+      // landed marks them stale, so the next draw that wants them reads them again. Board reads wait for a draw.
+      if (scope === 'chat' && state && pv.serverOfTool(seen.tool, state.servers)) {
+        const named = views.refsOfInput(seen.args)
+        const tool = parseToolName(seen.tool)?.tool
+        if (tool && views.isWriteTool(tool) && !seen.isError) for (const ref of named) titleStale.add(ref)
+        await noteMentions($, named)
       }
     }
     // The reply's ticket ids, now that this row may have taught the connection (HO-22951). A subagent's text is not drawn here.
-    if (e.agentId === undefined) syncTitles($, e.door === 'response' ? core.toolResultText(e.message.content) : undefined)
+    if (e.agentId === undefined) {
+      const said = e.door === 'response' ? core.toolResultText(e.message.content) : undefined
+      syncTitles($, said)
+      if (said) await noteMentions($, titles.refsIn(said))
+    }
     return result
   })
 
   // A reply's ticket ids drawn with their titles (HO-22951): display only, the stored message is untouched.
   // The drawing reads the cache from `$.state` (never writes it, never waits on the board) and redraws when a title lands.
+  // With the `stage` view on, the stage (or a milestone's status) follows the title inside the link text.
+  // With the `chips` view on (off by default), under the reply on surfaces with a pointer (desktop, vscode),
+  // a dim chip per id with a hover card: hovering the chip reveals the card (full title, stage, status,
+  // claim, parent, read time). The surface draws the reveal itself (a keyed Box's `hover`), so no hook runs on hover.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     let text: string | null = null
+    let chips: titles.Chip[] = []
     try {
       if (titles.wantsNoHighlight(e.props.text)) text = titles.stripNoHighlight(e.props.text)
       else if (!titlesOff && titles.mayHaveRefs(e.props.text)) {
+        const opts = views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value)
         const { value } = await $.state.get(TITLES)
-        const drawn = value ? titles.rewrite(e.props.text, value) : e.props.text
+        const suffixes = opts.stage ? views.suffixes((await $.state.get(INFOS)).value) : undefined
+        const drawn = value ? titles.rewrite(e.props.text, value, suffixes) : e.props.text
         if (drawn !== e.props.text) text = drawn
+        if (opts.chips && HOVER_SURFACES.has(e.surface) && !e.props.isSummary) {
+          const hovers = (await $.state.get(HOVERS)).value
+          if (hovers) chips = titles.chipsFor(e.props.text, hovers)
+        }
       }
     } catch {}
-    return text === null ? next(e) : next({ ...e, props: { ...e.props, text } })
+    const row = next(text === null ? e : { ...e, props: { ...e.props, text } })
+    if (chips.length === 0) return row
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {await row}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          {chips.map((c) => (
+            <Box key={`ho-chip-${c.ref}`} flexDirection="column">
+              <Text dimColor hover={{ bold: true }}>
+                {c.label}
+              </Text>
+              <Box display="none" hover={{ display: 'flex' }} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+                {c.lines.map((line, i) => (
+                  <Text bold={i === 0} dimColor={i === c.lines.length - 1}>
+                    {line}
+                  </Text>
+                ))}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      </Box>
+    )
   })
 
   on('command.run', { command: 'inbox' }, async ($, e) => {
@@ -1139,6 +1364,166 @@ export const register: Register = (on) => {
     } catch (err) {
       return { text: `pg: ${err instanceof Error ? err.message : String(err)}` }
     }
+  })
+
+  // /hoview: which ticket views are on (./ticket-views.ts names them); `/hoview mini open` floats the mini program view.
+  on('command.run', { command: 'hoview' }, async ($, e) => {
+    try {
+      if (titlesOff) return { text: 'hoview: off (APPHANDOFF_TICKET_TITLES=off). Unset it and start a new chat to turn the views on.' }
+      const command = views.parseHoview(e.args)
+      if (command.action === 'invalid') return { text: views.HOVIEW_USAGE }
+      if (command.action === 'mini') {
+        if (command.open) {
+          await setViewOption($, 'mini', true)
+          await openMini($)
+          return { text: 'Mini program view opened.' }
+        }
+        await $.ui.close({ id: MINI_PANE })
+        return { text: 'Mini program view closed.' }
+      }
+      if (command.action === 'set') await setViewOption($, command.name, command.on === 'toggle' ? !viewOpts[command.name] : command.on)
+      return { text: views.describeOptions(viewOpts) }
+    } catch (err) {
+      return { text: `hoview: ${err instanceof Error ? err.message : String(err)}` }
+    }
+  })
+
+  // The band above the composer (desktop, terminal; yields to a survey): `program` is one row with the latest
+  // program the chat touched (a press opens the /pg sidebar; ⧉ floats the mini view; an MS button opens that
+  // milestone's tickets), `shelf` is a second row with the chat's tickets, each a label whose card shows on hover.
+  // Only reads `$.state`; a card it lacks is asked off the drawing path (wantRefs).
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop') || titlesOff || off) return next(e)
+    const opts = views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value)
+    if (!opts.program && !opts.shelf) return next(e)
+    const infos = (await $.state.get(INFOS)).value
+    const focus = (await $.state.get(FOCUS)).value
+    const hovers = (await $.state.get(HOVERS)).value
+    const recent = focus?.recent ?? []
+    const goal = opts.program ? views.programFocus(recent, infos) : {}
+    const shelf = opts.shelf ? views.shelfRefs(focus?.watched ?? [], recent) : []
+    const pg = goal.pg
+    const ms = goal.ms
+    if (pg || ms || shelf.length > 0) wantRefs($, [...shelf, ...recent.slice(0, 6), ...(pg ? [pg] : []), ...(ms ? [ms] : [])])
+    if (!pg && shelf.length === 0) return next(e)
+    const { Box, Text, Button, Link } = $.ui.resolve(e)
+    // What the engine or another plugin draws there stays: the band is added beside it.
+    const rest = next(e)
+    return (
+      <Box flexDirection="column">
+        {await rest}
+        {pg && (
+          <Box key="band-program" flexDirection="row">
+            <Button key="band-pg" label={views.programLabel(pg, infos?.[pg])} onPress={() => void showProgram($, pg, true).catch(() => undefined)} />
+          </Box>
+        )}
+        {shelf.length > 0 && (
+          <Box key="band-shelf" flexDirection="row" flexWrap="wrap" columnGap={2}>
+            {shelf.map((ref) => {
+              const info = infos?.[ref]
+              const quiet = info?.stage === 'live' || info?.status === 'closed'
+              const label = views.shelfLabel(ref, info)
+              return (
+                <Box key={`shelf-${ref}`} flexDirection="column">
+                  <Text color={quiet ? undefined : views.stageColor(info?.stage)} dimColor={quiet || !info?.stage} hover={{ bold: true }}>
+                    {label}
+                  </Text>
+                  <Box display="none" hover={{ display: 'flex' }} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+                    {views.cardLines(hovers?.[ref], label).map((line, i) => (
+                      <Text bold={i === 0}>{line}</Text>
+                    ))}
+                    <Link href={`${titles.PORTAL}${ref}`} label="Open in portal" />
+                  </Box>
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+      </Box>
+    )
+  })
+
+  // The line under the composer: the ticket this chat holds a live lease on, else the latest one it named.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    try {
+      if (titlesOff || off || !views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value).hint) return next(e)
+      const focus = (await $.state.get(FOCUS)).value
+      const infos = (await $.state.get(INFOS)).value
+      const now = await $.clock.now()
+      const target = views.hintTarget(focus, now)
+      if (target) wantRefs($, [target.ref])
+      const tail = views.hintTail(focus, infos, now)
+      if (tail) return next({ ...e, props: { ...e.props, tail } })
+    } catch {}
+    return next(e)
+  })
+
+  // An AppHandoff tool call's row keeps its row, with one dim line under it naming the tickets the call names.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    let lines: string[] = []
+    try {
+      const tool = !titlesOff && !off && state ? views.appHandoffTool(e.props.tool, state.servers) : null
+      if (tool && views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value).toolrow) {
+        const refs = views.refsOfInput(e.props.input)
+        // A write still running has not changed anything yet: read once it landed.
+        if (!(views.isWriteTool(tool) && e.props.isRunning)) wantRefs($, refs.slice(0, views.TOOL_LINES))
+        lines = views.toolLines(refs, (await $.state.get(INFOS)).value)
+      }
+    } catch {}
+    const row = next(e)
+    if (lines.length === 0) return row
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {await row}
+        {lines.map((line) => (
+          <Text dimColor wrap="truncate-end">
+            {line}
+          </Text>
+        ))}
+      </Box>
+    )
+  })
+
+  // The mini program view: the latest program's name, one bar and done/total, small enough for a widget.
+  on('ui.render', { component: 'Pane', requestId: MINI_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    if (titlesOff || off || !views.optionsFrom((await $.state.get(VIEW_OPTIONS)).value).mini) {
+      return <Text dimColor>The mini program view is off (/hoview mini on).</Text>
+    }
+    const focus = (await $.state.get(FOCUS)).value
+    const infos = (await $.state.get(INFOS)).value
+    const goal = views.programFocus(focus?.recent ?? [], infos)
+    const pg = goal.pg
+    wantRefs($, [...(pg ? [pg] : []), ...(goal.ms ? [goal.ms] : [])])
+    if (!pg) return <Text dimColor>No program yet: name a milestone or program in the chat.</Text>
+    const totals = views.programTotals(infos?.[pg])
+    const bar = totals ? pv.barWidths(totals.done, totals.building, totals.total) : { shipped: 0, active: 0 }
+    const segments: [number, string][] = [
+      [bar.shipped, 'green'],
+      [bar.active, 'yellow'],
+    ]
+    return (
+      <Box flexDirection="column">
+        <Text bold wrap="truncate-end">
+          {pg} · {infos?.[pg]?.title ?? '…'}
+        </Text>
+        <Box flexDirection="row" width="100%" backgroundColor="gray">
+          {segments
+            .filter(([n]) => n > 0)
+            .map(([n, color]) => (
+              <Box width={`${n}%`} backgroundColor={color}>
+                <Text> </Text>
+              </Box>
+            ))}
+          <Box flexGrow={1}>
+            <Text> </Text>
+          </Box>
+        </Box>
+        <Text dimColor>{totals ? `${totals.done}/${totals.total} done` : 'reading…'}</Text>
+        {e.props.placement !== 'widget' && <Button key="mini-open" label="Open program view" onPress={() => void showProgram($, pg).catch(() => undefined)} />}
+      </Box>
+    )
   })
 
   // The program view pane: a program picker, Refresh, and the drawing (./pg-client.tsx).

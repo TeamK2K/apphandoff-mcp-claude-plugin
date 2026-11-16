@@ -2,6 +2,8 @@
 // the board and draws; this file turns what the board said into the numbers and lists the drawing
 // shows, and picks which board (server and project) the chat's own AppHandoff calls point at.
 
+import { PORTAL, portalUrlOf } from './apphandoff-server'
+
 export type Pg = { ref: string; name: string; headline?: string }
 export type Tk = { ref: string; title: string; stage: string; status: string; type?: string }
 export type Ms = {
@@ -11,9 +13,7 @@ export type Ms = {
   shipped: number
   /** Tickets in progress (in_progress or validation). */
   active: number
-  queued: number
   total: number
-  decisions: number
   /** A milestone approval waits on a person. */
   approval: boolean
 }
@@ -30,7 +30,7 @@ const MOVING_STAGES = ['in_progress', 'validation']
 /** Open tickets, the order the milestone list shows them in. */
 const STAGE_RANK = ['validation', 'in_progress', 'up_next', 'backlog']
 
-export const PORTAL = 'https://portal.apphandoff.com/'
+export { PORTAL }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const text = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() !== '' ? v : undefined)
@@ -72,7 +72,7 @@ export function ticketsToRead(item: unknown): string | null {
   return ACTIVE.includes(text(item.status) ?? '') && (countsOf(item).open ?? 0) > 0 ? item.ref : null
 }
 
-/** One milestone: its counts from the item, the moving and decision counts from its open tickets, the approval flag from `pending`. */
+/** One milestone: its counts from the item, the moving count from its open tickets, the approval flag from `pending`. */
 export function milestoneFrom(item: unknown, open: readonly Tk[], pending: ReadonlySet<string>): Ms | null {
   if (!isRecord(item) || !isMilestoneRef(item.ref)) return null
   const counts = countsOf(item)
@@ -86,18 +86,13 @@ export function milestoneFrom(item: unknown, open: readonly Tk[], pending: Reado
     status: text(item.status) ?? '',
     shipped,
     active,
-    queued: Math.max(0, total - shipped - active),
     total,
-    decisions: open.filter((k) => k.type === 'decision_needed').length,
     approval: pending.has(item.ref),
   }
 }
 
-/** Only a link on the portal is ever drawn as one. */
-export function portalUrl(url: unknown): string | null {
-  const u = text(url)
-  return u?.startsWith(PORTAL) ? u : null
-}
+/** Only a link on the portal is ever drawn as one (no whitespace or control characters either). */
+export const portalUrl = portalUrlOf
 
 /** A ticket's page on the portal; null for anything that is not HO-n. */
 export const ticketUrl = (ref: unknown): string | null => (isTicketRef(ref) ? `${PORTAL}${ref}` : null)
@@ -119,12 +114,6 @@ export function proposalsFrom(items: readonly unknown[]): { pending: Set<string>
 
 export const pct = (part: number, whole: number): number => (whole > 0 ? Math.round((part / whole) * 100) : 0)
 
-/** "just now", "42s ago", "3m ago". */
-export function ago(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000))
-  return s < 10 ? 'just now' : s < 60 ? `${s}s ago` : `${Math.round(s / 60)}m ago`
-}
-
 /** `fn` over every item, at most `limit` at a time; the results in the items' order. The first failure rejects and starts no more. */
 export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array<R>(items.length)
@@ -145,15 +134,15 @@ export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (it
   return out
 }
 
-export type Totals = { shipped: number; active: number; queued: number; total: number; decisions: number; percent: number }
+export type Totals = { shipped: number; active: number; total: number; percent: number }
 
 /** The program's totals: dropped milestones do not count. */
 export function totals(milestones: readonly Ms[]): Totals {
   const counted = milestones.filter((m) => m.status !== 'dropped')
-  const sum = (k: 'shipped' | 'active' | 'queued' | 'total' | 'decisions') => counted.reduce((n, m) => n + m[k], 0)
+  const sum = (k: 'shipped' | 'active' | 'total') => counted.reduce((n, m) => n + m[k], 0)
   const shipped = sum('shipped')
   const total = sum('total')
-  return { shipped, active: sum('active'), queued: sum('queued'), total, decisions: sum('decisions'), percent: pct(shipped, total) }
+  return { shipped, active: sum('active'), total, percent: pct(shipped, total) }
 }
 
 /**
@@ -255,8 +244,9 @@ export type BoardPick =
 /**
  * Which board /pg reads: the one AppHandoff connection the chat has used and the project its calls used
  * most recently. With no project named (the chat's calls took the connection's own), none is sent and the
- * connection resolves it as it did for the chat. Nothing to read when the add-on is off, or when this chat
- * has made no AppHandoff call yet (a connection restored from an earlier run does not count).
+ * connection resolves it as it did for the chat. Nothing to read when the add-on is off, or when `chatCalled`
+ * is false: this chat has made no AppHandoff call, in this run or in an earlier one of the same chat (register.tsx
+ * restores the flag, with the projects, from the chat's `ticket-focus:` entry after a reload or a resume).
  */
 export function pickBoard(servers: readonly string[], projects: readonly string[], chatCalled = true, off = false): BoardPick {
   if (off || !chatCalled || servers.length === 0) return { kind: 'none' }
