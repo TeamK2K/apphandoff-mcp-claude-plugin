@@ -81,21 +81,37 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   `MS-<n>` (milestone) and `PG-<n>` (program) in a reply with its title (a program's name)
   beside it, as a link on the portal (display only; the stored message is untouched, and ids
   in code are left alone). A reply that holds the word `no-hl-plz` draws its ids as written,
-  with the word hidden; the next reply draws titles again.
-  For that it reads the titles of the
-  ids it has not seen with `get` calls on your own connection, up to 10 ids per call, which
-  change nothing on your board. An id the board does not answer for stays as written.
+  with the word hidden; the next reply draws titles again. In the desktop app and VS Code,
+  a dim chip per id sits under the reply when you turn it on (`/hoview chips on`; it is off by default);
+  hovering it shows the longer title, the stage and
+  status, who holds the ticket and its milestone, with the day and time that was read. For that it reads the
+  ids it has not seen, or last read over 10 minutes ago, with `get` calls on your own connection,
+  up to 10 ids per call, which change nothing on your board. An id the board does not answer for
+  stays as written.
 - `/pg [PG-n]` (it reads nothing until you run it) opens a pane with a program's progress and its
   milestones, and a milestone's tickets when you press its number; a ticket opens on the portal.
   It reads the board the chat's own AppHandoff calls used, with `find` reads that change nothing;
   with no AppHandoff call in the chat yet (or with `APPHANDOFF_INBOX=off`), it says so and reads
-  nothing. While the pane is open it reads again every 30 s (skipped while a read still runs); close
+  nothing; a chat that made calls before a reload or a resume has them remembered (see below). While the pane is open it reads again every 30 s (skipped while a read still runs); close
   the pane and it stops.
+- `/hoview` lists the ticket views, each its own switch (`/hoview <name|number> on|off`; the choice is
+  kept): `program` (one button above the composer, `PG-<n> · <done>/<total> done`, for the latest program
+  the chat named, that opens the `/pg` view), `shelf` (off unless turned on: a second band row with the
+  tickets this chat claimed or created, then the latest it named, each with its card on hover), `mini` (the floating view; `/hoview mini open`), `hint` (the line under
+  the composer names the ticket the chat holds, else the latest one it named), `toolrow` (one dim line
+  under each AppHandoff `ticket`, `get`, `plan` or `message` call naming the ticket), `stage` (the stage
+  after the title in a reply's ticket links) and `chips`. They draw from the cards read with the same
+  `get` calls as the titles (plus the milestone and program a card names); nothing is written to your board.
 - It sends nothing anywhere but your own AppHandoff connection.
-- It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
-  pruned after 14 days; the ticket titles it read, keys named `ticket-title:HO-<n>`, `ticket-title:MS-<n>`, `ticket-title:PG-<n>`, kept
-  7 days, or 1 day for an id the board did not answer) in Claude Code's own plugin store; it
-  writes no other files.
+- It keeps its small state in Claude Code's own plugin store; it writes no other files:
+  the per-chat watched list (keys named `session:<chat id>`, pruned after 14 days; it holds ticket
+  ids, message ids and times, never a message's text); the ticket titles it read (keys named
+  `ticket-title:HO-<n>`, `ticket-title:MS-<n>`, `ticket-title:PG-<n>`, kept 7 days, or 1 day for an
+  id the board did not answer), each with the card it read: stage, status, priority, size, who holds
+  the ticket and what it sits under; the ids each chat named and the project ids of its own AppHandoff
+  calls (keys named `ticket-focus:<chat id>`, 14 days), so a reload or a resume of the same chat keeps the
+  band and `/pg` on the same board; and your `/hoview` choices (`hoview-options`). With
+  `APPHANDOFF_TICKET_TITLES=off` the last three are not written.
 
 Cursor, Codex and every other MCP client stay fully supported without this plugin; only
 the instant wake of an idle Claude Code chat needs it.
@@ -121,15 +137,17 @@ the instant wake of an idle Claude Code chat needs it.
   signs it in (`/mcp`); the hooks never read the sign-in. Its tools are the same ones the
   connector or `claude mcp add` gives you.
 - **What `/pg` reads** (`find`, read-only, on your own AppHandoff connection and the project the
-  chat's own calls used most recently; nothing is read before the chat has made an AppHandoff
-  call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
+  chat's own calls used most recently, as the chat made them or as the plugin store remembers them
+  across a reload or a resume of the same chat; nothing is read before the chat has made an
+  AppHandoff call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
   `/pg` runs, when the pane first draws, on Refresh and every 30 s while the pane is open;
   `find` of **milestone** (a program's milestones), **proposal** (the approvals waiting on a person; read only when the chat's calls
   named a project, and a board that refuses this read just draws the pane without approve flags)
   and **ticket** (the open tickets of each milestone that is still moving, to count what is in
-  progress) when `/pg` runs, on Refresh, when you pick another program in the pane's Program
-  list (that program's milestones, proposals and open tickets), and every 30 s while the pane
-  is open; if a first read fails, it tries again every 60 s while the pane is open (and on the
+  progress) when `/pg` runs, on Refresh, when you pick a program in the pane's Program
+  list that this run has not read yet (that program's milestones, proposals and open tickets; a
+  program already read is only redrawn from its last read, until the next 30 s read), and every 30 s
+  while the pane is open; if a first read fails, it tries again every 60 s while the pane is open (and on the
   next 30 s read). It also
   does `find` of **ticket** (all tickets of one milestone, archived ones included) when
   you press a milestone number, and with each of those 30 s reads while that list is open. A

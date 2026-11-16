@@ -15,6 +15,8 @@ export const HOURLY_WAKES = 6
 export const HOUR_MS = 60 * 60_000
 export const AUTH_STOP_AFTER = 3
 export const EXCERPT_CHARS = 120
+/** Unannounced messages kept per watched ticket (the newest): polling goes on while wakes are paused or held. */
+export const MAX_PENDING = 50
 export const OWN_IDS_KEPT = 200
 export const DEFAULT_RETRY_S = 60
 export const WAKE_LINES = 10
@@ -23,11 +25,12 @@ export const OWN_WRITE_SETTLE_MS = 2_000
 
 // Which server is AppHandoff (the ten tool names, a server named like it, an
 // id-named server's answer) is decided once, in ./apphandoff-server.ts.
-import { isAppHandoffCall, isAppHandoffTool, mayBeAppHandoff, parseToolName } from './apphandoff-server'
+import { isAppHandoffCall, isAppHandoffTool, mayBeAppHandoff, parseToolName, portalUrlOf } from './apphandoff-server'
 import { isTimeout } from './call-timeout'
 export { DETECTOR_TOOLS, isAppHandoffTool, parseToolName } from './apphandoff-server'
 
-const PORTAL = 'https://portal.apphandoff.com'
+/** Text with every control character (ESC, C1, line breaks) turned into a space: what reaches a toast or `/inbox` is never raw board text. */
+const noControls = (s: string) => s.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
 
 /** Writes whose results can carry the id of a message this chat just wrote. */
 const WRITE_TOOLS = new Set(['ticket', 'message', 'plan'])
@@ -822,7 +825,7 @@ export function approvalIn(json: unknown): { proposal_id: string; url: string; t
   const link = awaiting ? nonEmpty(json.portal_url) : nonEmpty(appr?.url)
   return {
     proposal_id,
-    url: link?.startsWith(`${PORTAL}/`) ? link : '',
+    url: portalUrlOf(link) ?? '',
     to_status: awaiting ? nonEmpty(json.to_status) : null,
   }
 }
@@ -2045,9 +2048,8 @@ export function watchArgs(req: WatchRequest, state: InboxState): Record<string, 
 /** The op keys that ask for the watch list; the notice fields ride beside them in a combined call (HO-21344). */
 const watchFields = (req: WatchRequest) => ({ watch: req.refs, since: req.since })
 
-/** A portal link worth showing: https, no spaces or control characters. */
-const safeUrl = (v: unknown): string | null =>
-  typeof v === 'string' && v.length <= 300 && /^https:\/\/[^\s\u0000-\u001f\u007f-\u009f]+$/.test(v) ? v : null
+/** A portal link worth showing: on the portal origin, no spaces or control characters (the same check as an approval's link). */
+const safeUrl = portalUrlOf
 
 /**
  * A watch answer (`{card: {changed, unknown, pending_proposals}}` or the same flat),
@@ -2279,8 +2281,7 @@ export function skipReason(m: ThreadMessage, state: InboxState): Skip {
 
 /** UI-only excerpt; control characters stripped so a body cannot drive the terminal. */
 export const excerptOf = (body: string) =>
-  (body ?? '')
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+  noControls(body ?? '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, EXCERPT_CHARS)
@@ -2322,7 +2323,7 @@ export function applyWindow(
   }
   if (typeof window.last_at === 'string' && newer(window.last_at, cursor)) cursor = window.last_at
   const watched = [...state.watched]
-  watched[index] = { ...w, cursor, pending }
+  watched[index] = { ...w, cursor, pending: pending.slice(-MAX_PENDING) }
   return {
     state: { ...state, watched, ...(fresh.length > 0 && { lastActivityAt: now }) },
     fresh,
@@ -2559,7 +2560,7 @@ export function pollFailed(
   text: string,
   now: number,
 ): { state: InboxState; alert: boolean; firstError: boolean } {
-  const lastError = text.replace(/\s+/g, ' ').trim().slice(0, 160) || 'unknown error'
+  const lastError = noControls(text).replace(/\s+/g, ' ').trim().slice(0, 160) || 'unknown error'
   const firstError = state.lastError === null
   const retry = retryAfterMs(text)
   if (retry !== null) return { state: { ...state, lastError, lastPollAt: now, retryAt: now + retry }, alert: false, firstError }
@@ -2708,7 +2709,8 @@ export function toStored(state: InboxState, now: number, endedAt?: number): Stor
   return {
     ...(endedAt !== undefined && { endedAt }),
     servers: state.servers,
-    watched: state.watched,
+    // A message's excerpt is never stored: it is for the toast of the tick that read it.
+    watched: state.watched.map((w) => ({ ...w, pending: w.pending.map((p) => ({ ...p, excerpt: '' })) })),
     ownIds: state.ownIds,
     wakeTimes: state.wakeTimes,
     paused: state.paused,
@@ -2775,6 +2777,33 @@ function storedApproval(v: unknown): ApprovalWait | null {
   }
 }
 
+function storedPending(v: unknown): Pending | null {
+  if (!isRecord(v) || typeof v.id !== 'string' || typeof v.authorType !== 'string' || typeof v.createdAt !== 'string' || typeof v.receivedAt !== 'number') return null
+  return { id: v.id, authorType: v.authorType, createdAt: v.createdAt, excerpt: '', receivedAt: v.receivedAt }
+}
+
+/** One stored watched ticket rebuilt field by field: a field of the wrong type falls back, so a bad entry cannot throw in a tick. */
+function storedWatched(v: unknown, now: number): Watched | null {
+  if (!isRecord(v) || typeof v.ref !== 'string') return null
+  const orNull = <T>(x: unknown, ok: (y: unknown) => y is T): T | null => (ok(x) ? x : null)
+  const isStr = (y: unknown): y is string => typeof y === 'string'
+  const isNum = (y: unknown): y is number => typeof y === 'number' && Number.isFinite(y)
+  return {
+    ref: v.ref,
+    id: orNull(v.id, isStr),
+    number: orNull(v.number, isNum),
+    projectId: orNull(v.projectId, isStr),
+    cursor: orNull(v.cursor, isStr),
+    baselined: v.baselined === true,
+    watchedAt: isNum(v.watchedAt) ? v.watchedAt : now,
+    lastWakeAt: orNull(v.lastWakeAt, isNum),
+    pending: (Array.isArray(v.pending) ? v.pending.flatMap((p) => storedPending(p) ?? []) : []).slice(-MAX_PENDING),
+    ...((isStr(v.mark) || v.mark === null) && { mark: v.mark }),
+    ...((isNum(v.markRev) || v.markRev === null) && { markRev: v.markRev }),
+    ...((isNum(v.heldUntil) || v.heldUntil === null) && { heldUntil: v.heldUntil }),
+  }
+}
+
 export function fromStored(sessionId: string, raw: unknown, now: number): InboxState {
   const base = initialState(sessionId, now)
   if (!isRecord(raw)) return base
@@ -2783,7 +2812,7 @@ export function fromStored(sessionId: string, raw: unknown, now: number): InboxS
     ...base,
     servers: strings(raw.servers),
     watched: Array.isArray(raw.watched)
-      ? (raw.watched.filter((w) => isRecord(w) && typeof w.ref === 'string') as Watched[]).slice(-MAX_WATCHED)
+      ? raw.watched.flatMap((w) => storedWatched(w, now) ?? []).slice(-MAX_WATCHED)
       : [],
     ownIds: strings(raw.ownIds).slice(-OWN_IDS_KEPT),
     wakeTimes: Array.isArray(raw.wakeTimes) ? raw.wakeTimes.filter((t): t is number => typeof t === 'number') : [],

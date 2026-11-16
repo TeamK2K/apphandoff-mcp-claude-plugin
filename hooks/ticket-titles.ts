@@ -8,7 +8,12 @@
 // gains the dot and the title inside its link text; an id in a fenced block, in inline code, in any other link
 // or inside any URL is left as it was.
 
-export const PORTAL = 'https://portal.apphandoff.com/'
+import { PORTAL } from './apphandoff-server'
+import { type Info, parseInfo, REF_NUM } from './ticket-views'
+
+export { PORTAL }
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')
 
 /** Ids per board `get` (the tool takes at most 10 `refs`). */
 export const BATCH = 10
@@ -21,21 +26,27 @@ export const STORE_PREFIX = 'ticket-title:'
 /** A title found is kept 7 days (titles change rarely); a ref the board did not answer, 1 day. */
 export const HIT_TTL_MS = 7 * 24 * 60 * 60 * 1000
 export const MISS_TTL_MS = 24 * 60 * 60 * 1000
+/** A title's hover card (stage, status, claim) older than this is asked again when a reply names the id. */
+export const HOVER_TTL_MS = 10 * 60 * 1000
 /** After a failed lookup (not a not-found) nothing is asked for this long. */
 export const RETRY_MS = 2 * 60 * 1000
 
 /** A reply holding this word draws its ids as written, and the word itself is hidden; the next reply draws titles again. */
 export const NO_HIGHLIGHT = 'no-hl-plz'
 
+const NO_HIGHLIGHT_RUN = new RegExp(`[ \\t]*${escapeRegExp(NO_HIGHLIGHT)}[ \\t]*`, 'g')
+
 export const wantsNoHighlight = (text: string): boolean => text.includes(NO_HIGHLIGHT)
 
 /** The reply with every marker removed, and the space it leaves behind folded. */
 export function stripNoHighlight(text: string): string {
-  return text.replace(/[ \t]*no-hl-plz[ \t]*/g, (m) => (/^[ \t]/.test(m) && /[ \t]$/.test(m) ? ' ' : '')).replace(/^\n+/, '')
+  return text.replace(NO_HIGHLIGHT_RUN, (m) => (/^[ \t]/.test(m) && /[ \t]$/.test(m) ? ' ' : '')).replace(/^\n+/, '')
 }
 
 /** `HO-12`, `MS-3` or `PG-1` to its shortened title. */
 export type Titles = Record<string, string>
+/** `HO-12`, `MS-3` or `PG-1` to its hover card: the link's tooltip text, lines joined with `\n`. */
+export type Hovers = Record<string, string>
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -73,13 +84,13 @@ export function shortTitle(title: string): string {
   return kept.length < words.length || cutAlready ? `${kept.join(' ')}…` : kept.join(' ')
 }
 
-/** A title as markdown link text: brackets and backslashes escaped, line breaks gone. */
+/** A title as markdown link text: brackets, angle brackets and backslashes escaped, line breaks gone. */
 export const escapeLinkText = (s: string) =>
   s
     .replace(/`/g, '') // a backtick would open a code span that swallows the link's `](url)`
     .replace(/\|/g, '/') // a pipe would split a table cell
     .replace(/\s+/g, ' ')
-    .replace(/[\\[\]]/g, (c) => `\\${c}`)
+    .replace(/[\\[\]<>]/g, (c) => `\\${c}`) // `<` would open an autolink or raw HTML inside the text
 
 // ── the rewrite ──────────────────────────────────────────────────────────
 
@@ -87,8 +98,11 @@ export const escapeLinkText = (s: string) =>
 export const mayHaveRefs = (text: string) => /(?:HO|MS|PG)-\d/.test(text)
 
 // A link's text may hold escapes (`\[`, `\]`), which is how a title with brackets is drawn; a bare id right after `[` is a link's text, not prose.
-const ANY = /(!?\[(?:\\.|[^\]\n\\])*\]\([^)\n]*\))|(?<![A-Za-z0-9_/.\-#@:=?&%~+[])((?:HO|MS|PG)-[1-9]\d{0,8})(?![A-Za-z0-9_]|-[A-Za-z0-9])/g
-const PORTAL_URL = /^<?https:\/\/portal\.apphandoff\.com\/((?:HO|MS|PG)-[1-9]\d{0,8})\/?>?$/
+const ANY = new RegExp(
+  String.raw`(!?\[(?:\\.|[^\]\n\\])*\]\([^)\n]*\))|(?<![A-Za-z0-9_/.\-#@:=?&%~+[])((?:HO|MS|PG)-${REF_NUM})(?![A-Za-z0-9_]|-[A-Za-z0-9])`,
+  'g',
+)
+const PORTAL_URL = new RegExp(`^<?${escapeRegExp(PORTAL)}((?:HO|MS|PG)-${REF_NUM})/?>?$`)
 
 /** One `[text](url "title")`: its text, and the url without its optional title. */
 function parseLink(link: string): { text: string; url: string } | null {
@@ -222,10 +236,45 @@ export function refsIn(text: string): string[] {
   return [...refs]
 }
 
-/** The text with each id that has a title drawn as a portal link carrying it; the text itself when none has. */
-export function rewrite(text: string, titles: Titles): string {
+/**
+ * The text with each id that has a title drawn as a portal link carrying it; the text itself when none has.
+ * `suffixes` (ref to words, e.g. `● in progress`) are added after the title inside the link text.
+ */
+export function rewrite(text: string, titles: Titles, suffixes?: Record<string, string>): string {
   if (!mayHaveRefs(text)) return text
-  return walk(text, (ref) => titles[ref], new Set())
+  return walk(text, (ref) => (titles[ref] && suffixes?.[ref] ? `${titles[ref]} · ${suffixes[ref]}` : titles[ref]), new Set())
+}
+
+/** Hover chips under one reply at most. */
+export const MAX_CHIPS = 10
+
+/** One chip under a reply: `HO-12 · In progress`, and the card its hover reveals, line by line. */
+export type Chip = { ref: string; label: string; lines: string[] }
+
+/**
+ * Second lines of a hover card that are not a standing: who holds the ticket, a parent (`MS-3 …`, `PG-1 …`),
+ * or the priority and size alone. A card with no stage or status has one of these there instead (see hoverCard).
+ */
+const NOT_STANDING = /^(?:Claimed by |Not claimed$|(?:HO|MS|PG)-\d|\S+ priority\b|size )/
+
+/**
+ * The chips a reply draws under it: one per id it names outside code (in order, once each, at most
+ * `MAX_CHIPS`) that has a hover card. The label adds the card's standing (its second line's first
+ * part: a ticket's stage, a milestone's status) when the card has one; a second line that is the
+ * claim, a parent or the size is no standing.
+ */
+export function chipsFor(text: string, hovers: Hovers): Chip[] {
+  const out: Chip[] = []
+  for (const ref of refsIn(text)) {
+    const card = hovers[ref]
+    if (!card) continue
+    const lines = card.split('\n')
+    const second = lines.length > 2 ? (lines[1] ?? '') : ''
+    const stand = NOT_STANDING.test(second) ? '' : second.split(' · ')[0]?.trim()
+    out.push({ ref, label: stand ? `${ref} · ${stand}` : ref, lines })
+    if (out.length === MAX_CHIPS) break
+  }
+  return out
 }
 
 /** The reply's ids that still need asking: no title known, not asked about, at most the per-reply cap. */
@@ -265,11 +314,92 @@ export function readAnswer(json: unknown, asked: readonly string[]): Record<stri
   return out
 }
 
+// ── the hover card ───────────────────────────────────────────────────────
+
+const STAGE_WORDS: Record<string, string> = {
+  backlog: 'Backlog',
+  up_next: 'Up next',
+  in_progress: 'In progress',
+  validation: 'Validation',
+  live: 'Live',
+}
+
+/** A board word (`up_next`, `in_progress`) as plain words. */
+const words = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? (STAGE_WORDS[v] ?? v.replace(/_/g, ' ')) : null)
+
+/** One `MS-n name` / `PG-n name` line from a card's `milestone` or `program` field. */
+function parentLine(v: unknown): string | null {
+  if (!isRecord(v)) return null
+  const ref = typeof v.ref === 'string' ? v.ref : null
+  const name = typeof v.name === 'string' ? v.name : typeof v.title === 'string' ? v.title : null
+  return ref || name ? [ref, name].filter(Boolean).join(' ') : null
+}
+
+/**
+ * The hover card of one `get` card: its whole card title (the board cuts a ticket's at 70
+ * characters), then where it stands, who holds it and what it sits under, then `As of <asOf>`
+ * (the card is a snapshot, refreshed when a later reply names the id). Null for no usable card.
+ */
+export function hoverCard(item: unknown, asOf: string): string | null {
+  if (!isRecord(item)) return null
+  const title = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : null
+  if (title === null || title.trim() === '') return null
+  const lines = [title.trim()]
+  const kind = typeof item.kind === 'string' ? item.kind : typeof item.ref === 'string' && item.ref.startsWith('HO-') ? 'ticket' : null
+  if (kind === 'ticket') {
+    const stand = [words(item.stage), words(item.status)].filter(Boolean).join(' · ')
+    const sized = [typeof item.priority === 'string' ? `${item.priority} priority` : null, typeof item.size === 'string' ? `size ${item.size}` : null]
+      .filter(Boolean)
+      .join(', ')
+    if (stand || sized) lines.push([stand, sized].filter(Boolean).join(' · '))
+    const claims = Array.isArray(item.claims) ? item.claims.filter((c): c is string => typeof c === 'string' && c !== '') : []
+    if (claims.length > 0) lines.push(`Claimed by ${claims.join(', ')}`)
+    else if (item.stage !== 'live' && item.status !== 'closed') lines.push('Not claimed')
+    const ms = parentLine(item.milestone)
+    if (ms) lines.push(ms)
+  } else {
+    const stand = words(item.status) ?? words(item.state)
+    if (stand) lines.push(stand)
+    const pg = parentLine(item.program)
+    if (pg) lines.push(pg)
+  }
+  lines.push(`As of ${asOf}`)
+  return lines.join('\n')
+}
+
+/** The hover card of each card in a `get` answer that one of `asked` names. */
+export function readHovers(json: unknown, asked: readonly string[], asOf: string): Hovers {
+  if (!isRecord(json) || !Array.isArray(json.items)) return {}
+  const want = new Set(asked)
+  const out: Hovers = {}
+  for (const item of json.items) {
+    if (!isRecord(item) || typeof item.ref !== 'string') continue
+    const ref = item.ref.trim().toUpperCase()
+    if (!want.has(ref)) continue
+    const card = hoverCard(item, asOf)
+    if (card) out[ref] = card
+  }
+  return out
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** `Nov 16 14:05` (24-hour, this computer's time zone): when a hover card was read. A card is kept 7 days, so the day is part of it. */
+export function clockText(ms: number): string {
+  const d = new Date(ms)
+  return `${MONTHS[d.getMonth()]} ${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 // ── the cache ────────────────────────────────────────────────────────────
 
-export type StoredTitle = { title: string | null; savedAt: number }
+export type StoredTitle = { title: string | null; savedAt: number; hover?: string; info?: Info }
 
-export const toStored = (title: string | null, now: number): StoredTitle => ({ title, savedAt: now })
+export const toStored = (title: string | null, now: number, hover?: string, info?: Info): StoredTitle => ({
+  title,
+  savedAt: now,
+  ...(hover ? { hover } : {}),
+  ...(info ? { info } : {}),
+})
 
 /** A cached entry still good at `now`, else null (missing, malformed, or past its expiry). */
 export function fromStored(raw: unknown, now: number): StoredTitle | null {
@@ -277,13 +407,30 @@ export function fromStored(raw: unknown, now: number): StoredTitle | null {
   const title = typeof raw.title === 'string' && raw.title !== '' ? raw.title : null
   if (raw.title !== null && title === null) return null
   const age = now - raw.savedAt
-  return age > (title === null ? MISS_TTL_MS : HIT_TTL_MS) ? null : { title, savedAt: raw.savedAt }
+  if (age > (title === null ? MISS_TTL_MS : HIT_TTL_MS)) return null
+  if (title === null) return { title, savedAt: raw.savedAt }
+  // An entry from before the structured record has no `info`: it loads as it was.
+  const info = parseInfo(raw.info)
+  return {
+    title,
+    savedAt: raw.savedAt,
+    ...(typeof raw.hover === 'string' && raw.hover !== '' ? { hover: raw.hover } : {}),
+    ...(info ? { info } : {}),
+  }
 }
 
-/** The drawing's map after adding `found`, the oldest dropped past the cap. */
-export function mergeTitles(current: Titles | undefined, found: Titles): Titles {
-  const merged = { ...current, ...found }
+/**
+ * Whether a reply naming the id needs no lookup: a miss inside its day, or a title whose hover card
+ * was read within `HOVER_TTL_MS` (stage, status and claim move faster than titles).
+ */
+export const isFresh = (entry: StoredTitle | null, now: number): boolean =>
+  entry !== null && (entry.title === null || now - entry.savedAt <= HOVER_TTL_MS)
+
+/** The drawing's map after adding `found`, the oldest dropped past the cap. A key in `found` moves to the newest end, so a ref just refreshed is not the next dropped. */
+export function mergeTitles<T = string>(current: Record<string, T> | undefined, found: Record<string, T>): Record<string, T> {
+  const kept = Object.fromEntries(Object.entries(current ?? {}).filter(([k]) => !(k in found)))
+  const merged: Record<string, T> = { ...kept, ...found }
   const keys = Object.keys(merged)
   if (keys.length <= MAX_DRAWN) return merged
-  return Object.fromEntries(keys.slice(keys.length - MAX_DRAWN).map((k) => [k, merged[k] as string]))
+  return Object.fromEntries(keys.slice(keys.length - MAX_DRAWN).map((k) => [k, merged[k] as T]))
 }

@@ -36,7 +36,7 @@ const REFRESH_MS = 30_000
 const REF_CELLS = 9
 const PROGRESS_CELLS = 9
 
-// The same as ago() in ./program-view.ts (a client module imports nothing); tests/program-view.spec.ts pins them equal.
+// "just now", "42s ago", "3m ago". The only copy: a client module imports nothing, so it is not shared; tests/program-view.spec.ts runs this source.
 const ago = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 10 ? 'just now' : s < 60 ? `${s}s ago` : `${Math.round(s / 60)}m ago`
