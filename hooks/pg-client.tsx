@@ -3,7 +3,7 @@ import type { ClientModule, RenderChildren } from 'claude-code'
 // The /pg program view's drawing (HO-24860), a surface module: one total bar, the milestones still
 // moving as a table whose milestone number opens its tickets, the finished ones folded. It only draws:
 // ./register.tsx works the numbers out (./program-view.ts) and hands them over as props. It asks the
-// hooks module to re-read the board every minute, which runs only while this drawing is on screen.
+// hooks module to re-read the board every 30 s, which runs only while this drawing is on screen.
 type Row = { ref: string; title: string; status: string; percent: number | null; approval: boolean }
 type Props = {
   ref: string
@@ -31,7 +31,10 @@ const SHIPPED = 'green'
 const MOVING = 'yellow'
 const QUEUED = 'gray'
 const NEEDS_YOU = 'magenta'
-const REFRESH_MS = 60_000
+const REFRESH_MS = 30_000
+// The number and Progress columns hold their text whole: at least this many cells, wider when it needs.
+const REF_CELLS = 9
+const PROGRESS_CELLS = 9
 
 // The same as ago() in ./program-view.ts (a client module imports nothing); tests/program-view.spec.ts pins them equal.
 const ago = (ms: number) => {
@@ -67,27 +70,30 @@ const PgClient: ClientModule<Props, State> = (props, surface) => {
   )
 
   // One table row: four cells side by side. No fragments: a surface may stack
-  // a fragment's children instead of laying them into the row.
+  // a fragment's children instead of laying them into the row. The dot, the number and Progress keep
+  // their text on one line (sized by what they hold, never squeezed); the title takes the room left.
   const line = (
     key: string | undefined,
     ref: RenderChildren,
     title: RenderChildren,
     status: RenderChildren,
     progress: RenderChildren,
+    card?: RenderChildren,
   ) => (
-    <Box key={key} flexDirection="row" width="100%" paddingX={1} hover={key ? { backgroundColor: 'gray' } : undefined}>
-      <Box width="4%" minWidth={2} flexShrink={0}>
+    <Box key={key} flexDirection="row" width="100%" paddingX={1} columnGap={1} hover={key ? { backgroundColor: 'gray' } : undefined}>
+      <Box minWidth={2} flexShrink={0}>
         {status}
       </Box>
-      <Box width="14%" flexShrink={0}>
+      <Box minWidth={REF_CELLS} flexShrink={0}>
         {ref}
       </Box>
-      <Box width="68%" flexShrink={0} overflow="hidden" flexDirection="row" columnGap={1} paddingRight={1}>
+      <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden" flexDirection="row" columnGap={1}>
         {title}
       </Box>
-      <Box width="14%" flexShrink={0} justifyContent="flex-end">
+      <Box minWidth={PROGRESS_CELLS} flexShrink={0} justifyContent="flex-end">
         {progress}
       </Box>
+      {card}
     </Box>
   )
 
@@ -99,7 +105,7 @@ const PgClient: ClientModule<Props, State> = (props, surface) => {
         {m.ref}
       </Button>,
       [
-        <Box flexShrink={1} flexGrow={1} overflow="hidden">
+        <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden">
           <Text wrap="truncate-end" dimColor={quiet}>
             {m.title}
           </Text>
@@ -114,6 +120,11 @@ const PgClient: ClientModule<Props, State> = (props, surface) => {
         ●
       </Text>,
       <Text dimColor={quiet || !m.percent}>{m.percent === null ? '–' : `${m.percent}%`}</Text>,
+      // The whole title, shown under the row while the pointer is on it (the keyed row is the hover scope).
+      // It hangs off the row, not the title cell, so the cell's overflow clip cannot hide it.
+      <Box position="absolute" top={1} left={1} display="none" hover={{ display: 'flex' }} backgroundColor="gray" paddingX={1}>
+        <Text wrap="wrap">{m.title}</Text>
+      </Box>,
     )
   }
 
