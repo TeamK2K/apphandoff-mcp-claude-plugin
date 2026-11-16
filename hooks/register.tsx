@@ -778,7 +778,7 @@ function syncTitles($: EngineInterface, text?: string) {
 // named most recently; with no such call yet the pane says so and calls nothing). All reads are `find`
 // calls, which change nothing: the programs and the milestones with their pending approvals (and the
 // open tickets of each milestone still moving) when /pg runs or the pane first draws, on Refresh, and
-// every 60 s while the pane is open (its client module asks); a milestone's tickets when its number is
+// every 30 s while the pane is open (its client module asks; a tick is skipped while a read runs); a milestone's tickets when its number is
 // pressed (and with each refresh while that list is open). The numbers are ./program-view.ts's.
 
 const PG_PANE = 'pg-view'
@@ -1209,7 +1209,7 @@ export const register: Register = (on) => {
     )
   })
 
-  // The program view asks for a re-read every minute (only while its pane is open), or for a milestone's tickets.
+  // The program view asks for a re-read every 30 s (only while its pane is open), or for a milestone's tickets.
   on('ui.message', async ($, e, next) => {
     if (!e.module.endsWith('pg-client.tsx')) return next(e)
     try {
@@ -1217,8 +1217,9 @@ export const register: Register = (on) => {
       const pick = pgBoard()
       if (pick.kind === 'ok') {
         const v = viewOf(pick.key)
-        if (msg.refresh && (await paneOpen($, PG_PANE))) {
-          void fetchMilestones($, pick, v, msg.refresh)
+        // The same read as Refresh; a tick that comes while a read of this board still runs is skipped.
+        if (msg.refresh && v.loading.size === 0 && (await paneOpen($, PG_PANE))) {
+          void loadProgram($, pick, v)
           if (pgMilestone && (await paneOpen($, MS_PANE))) void fetchTickets($, pick, v, pgMilestone)
         }
         if (msg.open) await showMilestone($, pick, v, msg.open)

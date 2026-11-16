@@ -89,7 +89,8 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   milestones, and a milestone's tickets when you press its number; a ticket opens on the portal.
   It reads the board the chat's own AppHandoff calls used, with `find` reads that change nothing;
   with no AppHandoff call in the chat yet (or with `APPHANDOFF_INBOX=off`), it says so and reads
-  nothing. While the pane is open it reads again every 60 s; close the pane and it stops.
+  nothing. While the pane is open it reads again every 30 s (skipped while a read still runs); close
+  the pane and it stops.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state (the per-chat watched list, keys named `session:<chat id>`,
   pruned after 14 days; the ticket titles it read, keys named `ticket-title:HO-<n>`, `ticket-title:MS-<n>`, `ticket-title:PG-<n>`, kept
@@ -122,15 +123,16 @@ the instant wake of an idle Claude Code chat needs it.
 - **What `/pg` reads** (`find`, read-only, on your own AppHandoff connection and the project the
   chat's own calls used most recently; nothing is read before the chat has made an AppHandoff
   call, and nothing at all unless you run `/pg`): `find` of **program** (the program list) when
-  `/pg` runs, when the pane first draws and on Refresh; `find` of **milestone** (a program's
-  milestones), **proposal** (the approvals waiting on a person; read only when the chat's calls
+  `/pg` runs, when the pane first draws, on Refresh and every 30 s while the pane is open;
+  `find` of **milestone** (a program's milestones), **proposal** (the approvals waiting on a person; read only when the chat's calls
   named a project, and a board that refuses this read just draws the pane without approve flags)
   and **ticket** (the open tickets of each milestone that is still moving, to count what is in
   progress) when `/pg` runs, on Refresh, when you pick another program in the pane's Program
-  list (that program's milestones, proposals and open tickets), and every 60 s while the pane
-  is open; if a first read fails, it tries again every 60 s while the pane is open. It also
+  list (that program's milestones, proposals and open tickets), and every 30 s while the pane
+  is open; if a first read fails, it tries again every 60 s while the pane is open (and on the
+  next 30 s read). It also
   does `find` of **ticket** (all tickets of one milestone, archived ones included) when
-  you press a milestone number, and with each of those 60 s reads while that list is open. A
+  you press a milestone number, and with each of those 30 s reads while that list is open. A
   ticket you press opens its page on `https://portal.apphandoff.com`.
 - **What it sends, and where**: only to that AppHandoff connection: ticket, milestone and
   question ids, project ids and timestamps the chat's own AppHandoff calls already used, and
