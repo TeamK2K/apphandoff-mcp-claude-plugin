@@ -2,10 +2,10 @@
 // ./register.tsx collects the ids, asks the board, caches the answers and hands the drawing
 // a map; this file only decides what text a reply is drawn with.
 //
-// A reply that says `HO-20342` draws as `[HO-20342 · Show ticket titles beside…](https://portal.apphandoff.com/HO-20342)`
+// A reply that says `HO-20342` draws as `[Show ticket titles beside… (HO-20342)](https://portal.apphandoff.com/HO-20342)`
 // once the title is known; `MS-n` and `PG-n` the same (a program's `name` stands for its title). No dot leads the link.
 // An id the Mac hook already linked (`[HO-n](https://portal.apphandoff.com/HO-n)`)
-// gains the dot and the title inside its link text; an id in a fenced block, in inline code, in any other link
+// gains the title inside its link text; an id in a fenced block, in inline code, in any other link
 // or inside any URL is left as it was.
 
 import { PORTAL } from './apphandoff-server'
@@ -110,7 +110,8 @@ function parseLink(link: string): { text: string; url: string } | null {
   return m ? { text: m[1] ?? '', url: m[2] ?? '' } : null
 }
 
-const linkOf = (ref: string, title: string) => `[${ref} · ${escapeLinkText(title)}](${PORTAL}${ref})`
+/** Title first, the id after it in brackets: the words lead, the id stays for search and copy. */
+const linkOf = (ref: string, title: string) => `[${escapeLinkText(title)} (${ref})](${PORTAL}${ref})`
 
 /**
  * Walks the prose of a text (never a fenced block, never inline code), calling `titleOf` for each
