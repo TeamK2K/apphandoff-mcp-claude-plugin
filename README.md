@@ -78,8 +78,8 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   <project ids>` (off unless you run it) makes the chat a standing inbox for those projects.
 - It shows a status line and toasts, on your screen only.
 - Once the chat has used your AppHandoff connection, it draws each `HO-<n>` (ticket),
-  `MS-<n>` (milestone) and `PG-<n>` (program) in a reply with its title (a program's name)
-  beside it, as a link on the portal (display only; the stored message is untouched, and ids
+  `MS-<n>` (milestone) and `PG-<n>` (program) in a reply as its title (a program's name)
+  with the id after it in brackets, `Fix login (HO-7)`, as a link on the portal (display only; the stored message is untouched, and ids
   in code are left alone). A reply that holds the word `no-hl-plz` draws its ids as written,
   with the word hidden; the next reply draws titles again. In the desktop app and VS Code,
   a dim chip per id sits under the reply when you turn it on (`/hoview chips on`; it is off by default);
@@ -99,8 +99,8 @@ exception is **standby**, which you turn on yourself: it claims for a person's m
   the chat named, that opens the `/pg` view), `shelf` (off unless turned on: a second band row with the
   tickets this chat claimed or created, then the latest it named, each with its card on hover), `mini` (the floating view; `/hoview mini open`), `hint` (the line under
   the composer names the ticket the chat holds, else the latest one it named), `toolrow` (one dim line
-  under each AppHandoff `ticket`, `get`, `plan` or `message` call naming the ticket), `stage` (the stage
-  after the title in a reply's ticket links) and `chips`. They draw from the cards read with the same
+  under each AppHandoff `ticket`, `get`, `plan` or `message` call naming the ticket), `stage` (off unless turned on: the stage
+  after the title in a reply's ticket links) and `chips` (off unless turned on). Only the switches you flip are kept. They draw from the cards read with the same
   `get` calls as the titles (plus the milestone and program a card names); nothing is written to your board.
 - It sends nothing anywhere but your own AppHandoff connection.
 - It keeps its small state in Claude Code's own plugin store; it writes no other files:

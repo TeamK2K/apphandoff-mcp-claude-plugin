@@ -1179,7 +1179,7 @@ const MINI_PANE = 'pg-mini'
 async function setViewOption($: EngineInterface, name: views.OptionName, on: boolean): Promise<void> {
   viewOpts = { ...viewOpts, [name]: on }
   try {
-    await $.store.set(views.OPTIONS_KEY, viewOpts)
+    await $.store.set(views.OPTIONS_KEY, views.choicesWith(await $.store.get(views.OPTIONS_KEY), name, on))
   } catch {}
   await update($, VIEW_OPTIONS, () => ({ ...viewOpts }))
 }

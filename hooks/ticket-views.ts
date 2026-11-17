@@ -2,13 +2,13 @@
 // Pure, no `$`: ./register.tsx collects the ids, asks the board, keeps the answers in `$.state` and draws;
 // this file decides the options, the structured record of a card, and every line of text the views show.
 //
-// Seven options, each its own toggle (`/hoview`), all on except `shelf` and `chips` (defaultOptions):
+// Seven options, each its own toggle (`/hoview`), all on except `shelf`, `stage` and `chips` (defaultOptions):
 //   program  a band above the composer: the latest program the chat touched, with its progress
 //   shelf    the band's second row: the chat's tickets (watched first, then the latest mentioned)
 //   mini     a floating mini program view (a pane drawn as a widget)
 //   hint     the line under the composer names the ticket the chat holds, else the latest mentioned
 //   toolrow  one dim line under an AppHandoff tool call's row naming what the call read or wrote
-//   stage    the stage after the title in a reply's ticket links
+//   stage    the stage after the title in a reply's ticket links (off: it made every link loud)
 //   chips    hover chips under a reply (off: they are noisy)
 
 import { parseToolName } from './apphandoff-server'
@@ -29,7 +29,7 @@ const NOTES: Record<OptionName, string> = {
   chips: 'hover chips under a reply',
 }
 
-export const defaultOptions = (): Options => ({ program: true, shelf: false, mini: true, hint: true, toolrow: true, stage: true, chips: false })
+export const defaultOptions = (): Options => ({ program: true, shelf: false, mini: true, hint: true, toolrow: true, stage: false, chips: false })
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -62,6 +62,17 @@ export function optionsFrom(raw: unknown): Options {
   const out = defaultOptions()
   if (!isRecord(raw)) return out
   for (const name of OPTION_NAMES) if (typeof raw[name] === 'boolean') out[name] = raw[name]
+  return out
+}
+
+/**
+ * What is stored after one `/hoview` switch: only the choices the person made (known names, booleans),
+ * plus this one. A default left alone is never written, so a later default change reaches them.
+ */
+export function choicesWith(raw: unknown, name: OptionName, on: boolean): Partial<Options> {
+  const out: Partial<Options> = {}
+  if (isRecord(raw)) for (const n of OPTION_NAMES) if (typeof raw[n] === 'boolean') out[n] = raw[n]
+  out[name] = on
   return out
 }
 
