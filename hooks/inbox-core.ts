@@ -187,9 +187,13 @@ export function isOff(value: string | undefined): boolean {
 
 // ── identifying calls ────────────────────────────────────────────────────
 
-/** The one AppHandoff connection to poll through, or null when none or several. */
+/**
+ * The AppHandoff connection to poll through: the first one the chat used, or null when none yet.
+ * The Claude desktop app loads the claude.ai connector and the plugin's own connection side by
+ * side; both reach the same backend and account, so a second one never idles the inbox (HO-29197).
+ */
 export function activeServer(state: InboxState): string | null {
-  return state.servers.length === 1 ? (state.servers[0] ?? null) : null
+  return state.servers[0] ?? null
 }
 
 export function parseJson(text: string | undefined): unknown {
@@ -2599,7 +2603,6 @@ export function pollIntervalMs(state: InboxState, now: number): number {
 // ── what the person sees ─────────────────────────────────────────────────
 
 export function statusLine(state: InboxState): string | undefined {
-  if (state.servers.length > 1) return `inbox: ${state.servers.length} AppHandoff connections (${state.servers.join(', ')}) — idle`
   if (state.watched.length === 0 && !hasApprovals(state) && !hasDriven(state) && !hasQuestions(state) && !state.standby) return undefined
   if (state.authStopped) return 'inbox: stopped — AppHandoff sign-in failing'
   const paused = state.paused ? ' · paused (/inbox resume)' : ''
@@ -2634,7 +2637,7 @@ export function describe(state: InboxState, now: number): string {
   const server = activeServer(state)
   const lines = [
     `inbox: ${state.watched.length}/${MAX_WATCHED} watched${state.paused ? ` · wakes paused (${state.paused})` : ''}${state.authStopped ? ' · stopped (sign-in failing)' : ''}`,
-    `connection: ${server ?? (state.servers.length > 1 ? `ambiguous (${state.servers.join(', ')}) — idle` : 'none yet — learned from this chat’s first AppHandoff call')}`,
+    `connection: ${server ?? 'none yet — learned from this chat’s first AppHandoff call'}${state.servers.length > 1 ? ` (also used: ${state.servers.slice(1).join(', ')})` : ''}`,
     ...state.watched.map(
       (w) =>
         `  ${labelOf(w)}: ${w.baselined ? `since ${w.cursor ?? 'start'}` : 'baselining'} · ${w.pending.length} new · last wake ${ago(now, w.lastWakeAt)}`,
@@ -2693,7 +2696,7 @@ export const endedAtOf = (raw: unknown): number | null => (isRecord(raw) && type
 
 /**
  * The ended chats a sweep releases for (HO-21402), from store `[key, raw]` pairs: each entry other than
- * `ownKey` that carries the ended mark, is not expired, names exactly one server, and holds a live lease, as
+ * `ownKey` that carries the ended mark, is not expired, names a server, and holds a live lease, as
  * the state it would release from (its id from the key). `endedAt` is the entry's mark.
  */
 export function endedToRelease(entries: [string, unknown][], ownKey: string, now: number): { state: InboxState; endedAt: number }[] {
