@@ -1169,6 +1169,9 @@ async function showProgram($: EngineInterface, pg: string | undefined, raise = f
 async function showMilestone($: EngineInterface, t: Target, v: PgView, ms: string): Promise<void> {
   pgMilestone = ms
   void fetchTickets($, t, v, ms)
+  // An open of a pane already open only retitles it, so a press from the program view would leave the
+  // person there with nothing changed: close it first, so the fresh open is the one the surface shows.
+  if (await paneOpen($, MS_PANE)) await $.ui.close({ id: MS_PANE }).catch(() => undefined)
   await $.ui.open({ id: MS_PANE, title: ms })
 }
 
