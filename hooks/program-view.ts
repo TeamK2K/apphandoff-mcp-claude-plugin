@@ -238,20 +238,19 @@ export function rememberProject(projects: readonly string[], id: string | null):
 
 export type BoardPick =
   | { kind: 'none' }
-  | { kind: 'ambiguous'; servers: string[] }
   | { kind: 'ok'; server: string; project: string | null; key: string }
 
 /**
- * Which board /pg reads: the one AppHandoff connection the chat has used and the project its calls used
- * most recently. With no project named (the chat's calls took the connection's own), none is sent and the
+ * Which board /pg reads: the first AppHandoff connection the chat used (as the inbox polls, HO-29197) and the
+ * project its calls used most recently. A second connection (the desktop app loads the claude.ai connector and
+ * the plugin's own side by side, same backend and account) never blanks /pg (HO-29213). With no project named (the chat's calls took the connection's own), none is sent and the
  * connection resolves it as it did for the chat. Nothing to read when the add-on is off, or when `chatCalled`
  * is false: this chat has made no AppHandoff call, in this run or in an earlier one of the same chat (register.tsx
  * restores the flag, with the projects, from the chat's `ticket-focus:` entry after a reload or a resume).
  */
 export function pickBoard(servers: readonly string[], projects: readonly string[], chatCalled = true, off = false): BoardPick {
-  if (off || !chatCalled || servers.length === 0) return { kind: 'none' }
   const server = servers[0]
-  if (servers.length > 1 || server === undefined) return { kind: 'ambiguous', servers: [...servers] }
+  if (off || !chatCalled || server === undefined) return { kind: 'none' }
   const project = projects[0] ?? null
   return { kind: 'ok', server, project, key: `${server}|${project ?? ''}` }
 }

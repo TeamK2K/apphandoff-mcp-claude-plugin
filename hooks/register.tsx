@@ -1028,8 +1028,7 @@ function viewOf(key: string): PgView {
 }
 
 /** Why there is nothing to read, in words. */
-function pgNothing(pick: pv.BoardPick): string {
-  if (pick.kind === 'ambiguous') return 'This chat has used more than one AppHandoff connection, so /pg cannot tell which board to read.'
+function pgNothing(): string {
   return off ? 'The AppHandoff add-on is off (APPHANDOFF_INBOX=off), so /pg cannot tell which board this chat uses.' : NO_CALL
 }
 
@@ -1163,7 +1162,7 @@ async function showProgram($: EngineInterface, pg: string | undefined, raise = f
   // press from the band closes the pane first: the fresh open is the one the surface shows.
   if (raise && (await paneOpen($, PG_PANE))) await $.ui.close({ id: PG_PANE }).catch(() => undefined)
   await $.ui.open({ id: PG_PANE, title: 'Program view' })
-  if (pick.kind !== 'ok') return pgNothing(pick)
+  if (pick.kind !== 'ok') return pgNothing()
   return pg ? `Program view opened on ${pg}.` : 'Program view opened.'
 }
 
@@ -1592,7 +1591,7 @@ export const register: Register = (on) => {
       return <Text dimColor>The program view draws on the desktop app and terminal only.</Text>
     }
     const pick = pgBoard()
-    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing(pick)}</Text>
+    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing()}</Text>
     const v = viewOf(pick.key)
     // A pane drawn without /pg having run (it stayed up from an earlier chat) reads once.
     if (!v.asked.has('load')) void loadProgram($, pick, v)
@@ -1676,7 +1675,7 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'Pane', requestId: MS_PANE }, async ($, e) => {
     const { Box, Text, Link } = $.ui.resolve(e)
     const pick = pgBoard()
-    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing(pick)}</Text>
+    if (pick.kind !== 'ok') return <Text dimColor>{pgNothing()}</Text>
     const v = viewOf(pick.key)
     const ref = pgMilestone
     if (!ref) return <Text dimColor>No milestone selected.</Text>
