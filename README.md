@@ -38,7 +38,9 @@ AppHandoff MCP connection for you: its `.mcp.json` declares one HTTP server, `ap
 `https://api.apphandoff.com/mcp`. It holds no header, token or secret; you sign in with `/mcp`
 and Claude Code keeps the sign-in.
 
-Claude Code connects one server per URL, so you never get a second copy. If you added
+Claude Code connects one server per URL, so it never gets a second copy. The Claude desktop
+app can: it loads both the claude.ai AppHandoff connector and this plugin's connection. They reach the
+same backend and account, and the mod keeps polling through the first one the chat used. If you added
 AppHandoff yourself (`claude mcp add apphandoff https://api.apphandoff.com/mcp`), Claude Code
 connects only your entry. The claude.ai AppHandoff connector ranks below a plugin:
 Claude Code uses the plugin's connection instead of a second copy, so sign in to it once with
